@@ -168,10 +168,11 @@ def main():
     #
     forwardModel = icepack.models.IceStream(friction=frictionLaw,
                                             viscosity=viscosityNoTheta)
+    forwardSolver = icepack.solvers.FlowSolver(forwardModel, **opts)
     # initial solve
-    u0 = forwardModel.diagnostic_solve(u0=uObs, h=h0, s=s0, A=A, beta=beta,
-                                      grounded=grounded0, floating=floating0,
-                                      uThresh=forwardParams['uThresh'], **opts)
+    u0 = forwardSolver.diagnostic_solve(u=uObs, h=h0, s=s0, A=A, beta=beta,
+                                        grounded=grounded0, floating=floating0,
+                                        uThresh=forwardParams['uThresh'])
     # copy original state
     h, s = h0.copy(deepcopy=True), s0.copy(deepcopy=True)
     u = u0.copy(deepcopy=True)
@@ -187,19 +188,18 @@ def main():
         #
         melt = mf.piecewiseWithDepth(h, floating, meltParams)
         a = SMB + icepack.interpolate(melt, Q)
-        h = forwardModel.prognostic_solve(forwardParams['deltaT'], h0=h, u=u,
-                                          a=a, h_inflow=h0)
+        h = forwardSolver.prognostic_solve(forwardParams['deltaT'], h=h, u=u,
+                                           a=a, h_inflow=h0)
 
         # NEED TO MODIFY THIS FUNCTION TO UPDATE GROUNDED AND FLOATING                                  
-        s = forwardModel.compute_surface(h=h, b=zb)
+        s = icepack.compute_surface(h=h, b=zb)
         # NEED TO APPLY BETA SCALE
         betaScale = mf.reduceNearGLBeta(s, s0, zF, grounded, Q, forwardParams['GLThresh'])
         # NEED TO ADD MELT FUNCTION
         #
-        u = forwardModel.diagnostic_solve(u0=u, h=h, s=s, A=A, beta=beta,
-                                          grounded=grounded, floating=floating,
-                                          uThresh=forwardParams['uThresh'],
-                                          **opts)
+        u = forwardSolver.diagnostic_solve(u=u, h=h, s=s, A=A, beta=beta,
+                                           grounded=grounded, floating=floating,
+                                           uThresh=forwardParams['uThresh'])
         areaG = firedrake.assemble(grounded * firedrake.dx(mesh))
         areaF = area - areaG
         #

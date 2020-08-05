@@ -305,17 +305,16 @@ def defineProblemBeta(beta, model, h, s, u, Anew, theta, grounded, floating,
     """
     problem = icepack.inverse.InverseProblem(
         model=model,
-        method=icepack.models.IceStream.diagnostic_solve,
         objective=objectiveBeta,
         regularization=regularizationBeta,
         state_name='u',
         state=u,
         parameter_name='beta',
         parameter=beta,
-        model_args={'h': h, 's': s, 'u0': u, 'A': Anew, 'theta': theta,
-                    'grounded': grounded, 'floating': floating, 'tol': 1e-6,
-                    'uThresh': uThresh},
-        dirichlet_ids=opts['dirichlet_ids'],
+        solver_kwargs={**opts, 'tolerance': 1e-6},
+        diagnostic_solve_kwargs={'h': h, 's': s, 'A': Anew, 'theta': theta,
+                                 'grounded': grounded, 'floating': floating,
+                                 'uThresh': uThresh}
     )
     return problem
 
@@ -326,17 +325,16 @@ def defineProblemTheta(theta, model, h, s, u, Anew, beta, grounded, floating,
     """
     problem = icepack.inverse.InverseProblem(
         model=model,
-        method=icepack.models.IceStream.diagnostic_solve,
         objective=objectiveTheta,
         regularization=regularizationTheta,
         state_name='u',
         state=u,
         parameter_name='theta',
         parameter=theta,
-        model_args={'h': h, 's': s, 'u0': u, 'A': Anew, 'beta': beta,
-                    'grounded': grounded, 'floating': floating, 'tol': 1e-6,
-                    'uThresh': uThresh},
-        dirichlet_ids=opts['dirichlet_ids'],
+        solver_kwargs={**opts, 'tolerance': 1e-6},
+        diagnostic_solve_kwargs={'h': h, 's': s, 'A': Anew, 'beta': beta,
+                                 'grounded': grounded, 'floating': floating,
+                                 'uThresh': uThresh}
     )
     return problem
 
@@ -526,10 +524,11 @@ def main():
     # Setup diagnostic solve
     model = icepack.models.IceStream(friction=frictionLaw,
                                      viscosity=mf.viscosity)
-    u = model.diagnostic_solve(u0=uObs, h=h, s=s, A=Anew, beta=beta,
-                               theta=theta, grounded=grounded,
-                               uThresh=inversionParams['uThresh'],
-                               floating=floating, **opts)                      
+    solver = icepack.solvers.FlowSolver(model, **opts)
+    u = solver.diagnostic_solve(u=uObs, h=h, s=s, A=Anew, beta=beta,
+                                theta=theta, grounded=grounded,
+                                uThresh=inversionParams['uThresh'],
+                                floating=floating)
     velocityError(uObs, u, area, message='Initial error')
     PETSc.Sys.Print(f'Time for initial model {datetime.now() - startTime}')
     PETSc.Sys.Print(f'Objective for initial model '
