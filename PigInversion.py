@@ -34,6 +34,7 @@ def setupPigInversionArgs():
                 'velocity':
                 '/home/ian/ModelRuns/PIG2018/Data/velocity/pseudo2000/vQ2000',
                 'mesh': 'PigFull_Initial.exp',
+                'meshOversample': 2,
                 'rheology': 'PIG2018.B.tif',
                 'degree': 2,
                 'friction': 'weertman',
@@ -230,7 +231,7 @@ def regularizationTheta(theta):
     # floating mask will not stop steep gradient at gl
     R1 = regTheta * 0.5 * (L / Phi)**2 * \
         firedrake.inner(grad(theta), grad(theta))
-    R2 = theta**2 * firedrake.Constant(4.)
+    R2 = theta**2 * firedrake.Constant(4. * 0.)
     R = (R1 + R2) * firedrake.dx(mesh)
     return R
 
@@ -324,7 +325,8 @@ def thetaInit(Ainit, Q, Q1, grounded, floating, inversionParams):
         thetaInit = icepack.interpolate(thetaTemp, Q)
         return thetaInit
     # Use initial A to init inversion
-    theta = firedrake.ln(Ainit)  # FLOATING MASK????
+    Atheta = mf.firedrakeSmooth(Ainit, alpha=1000)
+    theta = firedrake.ln(Atheta)  # FLOATING MASK????
     theta = firedrake.interpolate(theta, Q)
     return theta
 
@@ -549,9 +551,9 @@ def testViscosity(velocity, thickness, fluidity, theta):
         floatingSmooth * firedrake.exp(theta)
     h = thickness
     u = velocity
-    return icepack.models.viscosity.viscosity_depth_averaged(u,
-                                                             h,
-                                                             A)
+    return icepack.models.viscosity.viscosity_depth_averaged(velocity=u,
+                                                             thickness=h,
+                                                             fluidity=A)
 
 
 def setupTaperedMasks(inversionParams, grounded, floating):
@@ -578,24 +580,28 @@ def printExtremes(**kwargs):
     Print(''.join(['-']*40))
 
 
-def setupSolvers(thickness, surface, velocity, fluidity, grounded, floating, beta, theta, model, opts,
-                 inversionParams, solverMethod):
+def setupSolvers(thickness, surface, velocity, fluidity, grounded, floating,
+                 beta, theta, model, opts, inversionParams, solverMethod):
     ''' Set up the solvers '''
     solverBeta = None
     if inversionParams['solveBeta']:
-        problemBeta = defineProblemBeta(beta, model, thickness, surface, velocity, fluidity, theta,
+        problemBeta = defineProblemBeta(beta, model, thickness, surface,
+                                        velocity, fluidity, theta,
                                         grounded, floating,
                                         inversionParams['uThresh'], opts)
-        solverBeta = solverMethod(problemBeta, stepInfo)
+        solverBeta = solverMethod(problemBeta, stepInfo,
+                                  search_max_iterations=300)
     #                              search_tolerance=1e-6)
     #
     # Set up problem for theta
     solverTheta = None
     if inversionParams['solveViscosity']:
-        problemTheta = defineProblemTheta(theta, model, thickness, surface, velocity, fluidity, beta,
+        problemTheta = defineProblemTheta(theta, model, thickness, surface,
+                                          velocity, fluidity, beta,
                                           grounded, floating,
                                           inversionParams['uThresh'], opts)
-        solverTheta = solverMethod(problemTheta, stepInfo)
+        solverTheta = solverMethod(problemTheta, stepInfo,
+                                   search_max_iterations=300)
         #                           search_tolerance=1e-6)
     return solverBeta, solverTheta
 
@@ -619,8 +625,11 @@ def main():
     solverMethod = solverMethods[inversionParams['solverMethod']]
     #
     # Read mesh and setup function spaces
-    mesh, Q, V, meshOpts = mf.setupMesh(inversionParams['mesh'],
-                                        degree=inversionParams['degree'])
+    mesh, Q, V, meshOpts = \
+        mf.setupMesh(inversionParams['mesh'],
+                     degree=inversionParams['degree'],
+                     meshOversample=inversionParams['meshOversample'])
+    Print(f'Mesh Elements={mesh.num_cells()} Vertices={mesh.num_vertices()}')
     Q1 = None
     if inversionParams['initWithDeg1']:
         Q1 = firedrake.FunctionSpace(mesh, family='CG', degree=1)

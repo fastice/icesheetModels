@@ -19,8 +19,14 @@ import os
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 rhoW = rhoI * 1028./917.  # This ensures rhoW based on 1028
-
+waterToIce = 1000./917.
+iceToWater = 917./1000.
 floatingG, groundedG, mesh = None, None, None
+
+# These numbers derived from repeat of the Joughin et al 2019 experiments
+# with data sets used in the current experiment. They have not been evaluted
+# on ice streams other than PIG.
+GLThreshDefaults = {'schoof': 41, 'weertman': 122}
 
 
 def parsePigForwardArgs():
@@ -28,16 +34,18 @@ def parsePigForwardArgs():
     defaults = {'geometry': 'PigGeometry.yaml',
                 'degree': 1,
                 'plotResult': False,
-                'prognosticOnly': False,
                 'params': None,
                 'inversionResult': None,
                 'nYears': 10.,
-                'GLThresh': 40.,
+                'GLThresh': None,  # Optimal for PIG schoof
                 'SMB': '/home/ian/ModelRuns/Thwaites/BrookesMap/'
                 'OLS_Trend_plus_Resid_9b9.tif',
                 'deltaT': 0.05,
                 'meltParamsFile': 'meltParams.yaml',
                 'meltParams': 'linear',
+                'meltAnomaly': 0.0,
+                'meltPeriod': None,
+                'restart': False,
                 'meltModel': 'piecewiseWithDepth',
                 'profileFile': '/Volumes/UsersIan/ModelExperiments/'
                 'PigForward/llprof/piglong.xy',
@@ -56,20 +64,26 @@ def parsePigForwardArgs():
                         help=f'Simulation length (yrs) [{defaults["nYears"]}]')
     parser.add_argument('--GLThresh', type=float, default=None,
                         help='Threshhold for GL weakening '
-                        f'[{defaults["GLThresh"]}]')
+                        f'[{GLThreshDefaults}]')
     parser.add_argument('--meltParams', type=str, default=None,
                         help='Name of melt params from meltParams.yaml file '
                         f'[{defaults["meltParams"]}]')
+    parser.add_argument('--restart', action='store_true', default=False,
+                        help=f'Restart simulation[{defaults["restart"]}]')
     parser.add_argument('--meltParamsFile', type=str, default=None,
                         help='Yaml file with melt params'
                         f'[{defaults["meltParamsFile"]}]')
+    parser.add_argument('--meltAnomaly', type=rangeLimitedFloatType,
+                        default=None, help='Amplitude of melt anomaly as '
+                        f'fraction of mean [{defaults["meltAnomaly"]}]')
+    parser.add_argument('--meltPeriod', type=rangeLimitedFloatType,
+                        default=None, help='Period of sinusoidal melt anomaly'
+                        f' in years[{defaults["meltPeriod"]}]')
     parser.add_argument('--deltaT', type=float, default=None,
                         help=f'Time step (yrs) [{defaults["deltaT"]}]')
     parser.add_argument('--plotResult', action='store_true',
                         default=defaults["plotResult"],
                         help=f'Display results [{defaults["plotResult"]}]')
-    parser.add_argument('--prognosticOnly', action='store_true', default=False,
-                        help=f'Solve prognostic with input vel [{False}]')
     parser.add_argument('--params', type=str, default=None,
                         help=f'Input parameter file (.yaml)'
                         f'[{defaults["params"]}]')
@@ -86,6 +100,16 @@ def parsePigForwardArgs():
     #
 
     return forwardParams, inversionParams
+
+
+def rangeLimitedFloatType(arg):
+    try:
+        f = float(arg)
+    except ValueError:
+        raise argparse.ArgumentTypeError('Must be a float')
+    if f <= 0. or f > 1000.:
+        raise argparse.ArgumentTypeError('Must be > 0 and < 1000')
+    return f
 
 
 def parseForwardParams(parser, defaults):
@@ -128,12 +152,9 @@ def parseForwardParams(parser, defaults):
         except Exception:
             myerror(f'parseForwardParams: parameter- {key} - missing from'
                     ' inversion result')
+    if forwardParams['GLThresh'] is None:
+        forwardParams['GLThresh'] = GLThreshDefaults[forwardParams['friction']]
     return forwardParams, inversionParams
-
-
-def viscosityNoTheta(velocity, thickness, grounded, A):
-    return icepack.models.viscosity.viscosity_depth_averaged(velocity,
-                                                             thickness, A)
 
 
 def velocityError(uO, uI, area, message=''):
@@ -151,7 +172,7 @@ def setupTimesSeriesPlots(plotData, forwardParams):
     ''' Setup axes for times series plots
     '''
     figTS, axesTS = plt.subplots(3, 1, figsize=(5.5, 12))
-    yLabels = ['dA (km^2)', 'dV (km^3/yr)', 'Tot. Vol. Change (km^3)']
+    yLabels = ['dA (km^2)', 'dV (GT/yr)', 'Tot. Vol. Change (GT)']
     # axesTS = np.append(axesTS, axesTS[1].twinx())
     for ax, yLabel in zip(axesTS, yLabels):
         ax.set_xlim([0, forwardParams['nYears']])
@@ -161,13 +182,161 @@ def setupTimesSeriesPlots(plotData, forwardParams):
     plotData['figTS'], plotData['axesTS'] = figTS, axesTS
 
 
-def volumeChange(grounded, floating, h, hLast, DVF, DVG, dT, mesh):
+def volumeChange(grounded, floating, h, u, a, mesh):
     ''' Compute volume change on grounded and floating ice. Summing deltaVG
     should automatically provide VAF since the loss is always grounded.
     '''
-    deltaVG = firedrake.assemble(grounded * (h - hLast) * firedrake.dx(mesh))
-    deltaVF = firedrake.assemble(floating * (h - hLast) * firedrake.dx(mesh))
-    return deltaVF/dT, deltaVG/dT, DVF + deltaVF, DVG + deltaVG
+    fluxDiv = firedrake.div(u * h)
+    # flux divergence
+    fluxDivFloating = firedrake.assemble(fluxDiv * floating * firedrake.dx)
+    fluxDivGrounded = firedrake.assemble(fluxDiv * grounded * firedrake.dx)
+    # net accumulation
+    Af = firedrake.assemble(a * floating * firedrake.dx)
+    Ag = firedrake.assemble(a * grounded * firedrake.dx)
+    deltaVG = -fluxDivGrounded + Ag
+    deltaVF = -fluxDivFloating + Af
+    # deltaVG = firedrake.assemble(grounded * (h - hLast) * firedrake.dx(mesh))
+    # deltaVF = firedrake.assemble(floating * (h - hLast) * firedrake.dx(mesh))
+    # print(deltaVG/1e9, deltaVG1/1e9, deltaVF/1e9,deltaVF1/1e9,Ag/1e9, Af/1e9)
+    return deltaVF, deltaVG
+
+
+def reinitSummary(forwardParams):
+    ''' Init with last temporary summary file '''
+    summaryFile = f'{forwardParams["forwardResultDir"]}/' \
+                  f'{forwardParams["forwardResult"]}.summary.yaml.tmp'
+    if not os.path.exists(summaryFile):
+        myerror('Cannot reinit with tmp summary {summaryFile}')
+    with open(summaryFile, 'r') as fp:
+        mp = yaml.load(fp, Loader=yaml.FullLoader)
+    # summaryData = mp['summaryFile']
+    # Temp file will already have these values appended
+    # for key in ['deltaVF', 'deltaVG']:
+    #    summaryData[key].append(0)
+    # for key in ['DVF', 'DVG']:
+    #    summaryData[key].append(summaryData[key][-1])
+    return mp['summaryFile']
+
+
+def initSummary(grounded0, floating0, h0, u0, meltModel, meltParams, SMB, Q,
+                mesh, forwardParams, restart=False):
+    ''' Compute initial areas and summary data
+    '''
+    if restart:
+        return reinitSummary(forwardParams)
+    # start from scratch
+    area = firedrake.assemble(firedrake.Constant(1) * firedrake.dx(mesh))
+    gArea0 = firedrake.assemble(grounded0 * firedrake.dx(mesh))
+    fArea0 = area - gArea0
+    melt = meltModel(h0, floating0, meltParams, Q, u0)
+    meltTot = firedrake.assemble(icepack.interpolate(floating0 * melt, Q) *
+                                 firedrake.dx(mesh))
+    SMBfloating = firedrake.assemble(icepack.interpolate(floating0 * SMB, Q) *
+                                     firedrake.dx(mesh))
+    SMBgrounded = firedrake.assemble(icepack.interpolate(grounded0 * SMB, Q) *
+                                     firedrake.dx(mesh))
+    summaryData = {'year': [0], 'DVG': [0, 0], 'DVF': [0, 0],
+                   'deltaVF': [0, 0], 'deltaVG': [0, 0],
+                   'gArea': [float(gArea0)], 'fArea': [float(fArea0)],
+                   'meltTot': [float(meltTot)], 'area': float(area),
+                   'SMBgrounded': [float(SMBgrounded)],
+                   'SMBfloating': [float(SMBfloating)],
+                   'dTsum': 1.}
+    return summaryData
+
+
+def doRestart(forwardParams, zb, deltaT, chk, Q, V):
+    ''' Read in last state to restart simulation and regenerate summary data
+    '''
+    tSteps, index = chk.get_timesteps()
+    t = tSteps[-1]
+    chk.set_timestep(t, idx=index[-1])
+    myVars = {}
+    for varName in ['h', 's', 'floating', 'grounded']:
+        myVar = firedrake.Function(Q, name=varName)
+        chk.load(myVar, name=varName)
+        myVars[varName] = myVar
+    #
+    myVar = firedrake.Function(V, name='u')
+    chk.load(myVar, name='u')
+    myVars['u'] = myVar
+    zF = mf.flotationHeight(zb, Q)
+    hLast = myVars['h'].copy(deepcopy=True)
+    return t + deltaT, myVars['h'], hLast, myVars['s'], myVars['u'], zF, \
+        myVars['grounded'], myVars['floating']
+
+
+def computeSummaryData(SD, h, hLast, s, u, a, melt, SMB, grounded, floating,
+                       year, Q, mesh, deltaT, beginTime):
+    ''' Compute summary results and sort in summaryData
+        Save all as float for yaml output
+    '''
+    deltaVF, deltaVG = \
+        volumeChange(grounded, floating, h, u, a, mesh)
+    SD['deltaVF'][-1] += deltaVF * deltaT * iceToWater
+    SD['deltaVG'][-1] += deltaVG * deltaT * iceToWater
+    SD['DVF'][-1] += deltaVF * deltaT * iceToWater
+    SD['DVG'][-1] += deltaVG * deltaT * iceToWater
+    print(f"++{year:0.3f} {SD['deltaVF'][-1]/1e9:0.3f} "
+          f"{SD['deltaVG'][-1]/1e9:0.3f} {SD['DVF'][-1]/1e9:0.3f} "
+          f"{SD['DVG'][-1]/1e9:0.3f}")
+    #
+    if year % SD['dTsum'] > .0001 * year or year < SD['dTsum']:
+        return False
+    print(f'year {year} runtime {datetime.now() - beginTime}')
+    #
+    gArea = firedrake.assemble(grounded * firedrake.dx(mesh))
+    SD['year'].append(float(year))
+    SD['gArea'].append(gArea)
+    SD['fArea'].append(SD['area'] - gArea)
+    # append a new zero value to start incrementing
+    SD['deltaVF'].append(0)
+    SD['deltaVG'].append(0)
+    # append current value to start incrementing
+    SD['DVF'].append(SD['DVF'][-1])
+    SD['DVG'].append(SD['DVG'][-1])
+    #
+    meltTot = firedrake.assemble(icepack.interpolate(floating * melt, Q) *
+                                 firedrake.dx(mesh))
+    SD['meltTot'].append(float(meltTot))
+    SMBfloating = firedrake.assemble(icepack.interpolate(floating * SMB, Q) *
+                                     firedrake.dx(mesh))
+    SD['SMBfloating'].append(float(SMBfloating))
+    SMBgrounded = firedrake.assemble(icepack.interpolate(grounded * SMB, Q) *
+                                     firedrake.dx(mesh))
+    SD['SMBgrounded'].append(float(SMBgrounded))
+    #
+    print(f'{year}: Initial melt {SD["meltTot"][0] / 1e9:.2f} current melt '
+          f' {meltTot / 1e9:.2f}')
+    return True
+
+
+def saveSummaryData(forwardParams, summaryData, tmp=False):
+    ''' Write summary data to yaml file
+    '''
+    summaryFile = f'{forwardParams["forwardResultDir"]}/' \
+                  f'{forwardParams["forwardResult"]}.summary.yaml'
+    if tmp:
+        summaryFile += '.tmp'
+    # Trim last values, which were used for summation of next step
+    if not tmp:  # Only trim final value
+        for key in ['deltaVF', 'deltaVG', 'DVG', 'DVF']:
+            summaryData[key] = summaryData[key][0:-1]
+    # Convert numpy to list
+    for s in summaryData:
+        if isinstance(summaryData[s], np.ndarray):
+            summaryData[s] = summaryData[s].tolist()
+        # convert list elements out of np
+        if isinstance(summaryData[s], list):
+            tmp = []
+            for x in summaryData[s]:
+                if isinstance(x, (np.generic)):
+                    x = x.item()
+                tmp.append(x)
+            summaryData[s] = tmp
+    # Now write result to yaml
+    with open(summaryFile, 'w') as fpYaml:
+        yaml.dump({'summaryFile': summaryData}, fpYaml)
 
 
 def timeSeriesPlots(year, plotData, summaryData):
@@ -182,12 +351,13 @@ def timeSeriesPlots(year, plotData, summaryData):
     axesTS[0].plot(t, dShelfArea, 'b.', label='dA floating')
     # Compute and plot volume changes
     # axesTS[2].plot(t, summaryData['Umax-U0'][-1], 'ro', label='Max speedup')
-    axesTS[1].plot(t, summaryData['deltaVF'][-1]/1e9, 'bo',
-                   label='dV floating')
-    axesTS[1].plot(t, summaryData['deltaVG'][-1]/1e9, 'ko',
-                   label='dV grounded')
-    axesTS[1].plot(t, summaryData['meltTot'][-1]/1e9, 'ro',
-                   label='Melt')
+    if len(summaryData['deltaVF']) > 1:
+        axesTS[1].plot(t, summaryData['deltaVF'][-2]/1e9, 'bo',
+                       label='dV floating')
+        axesTS[1].plot(t, summaryData['deltaVG'][-2]/1e9, 'ko',
+                       label='dV grounded')
+        axesTS[1].plot(t, summaryData['meltTot'][-1]/1e9, 'ro',
+                       label='Melt')
     # Do legend on first plot
     if len(summaryData['year']) < 2:
         axesTS[2].plot(np.nan, 'cd', label='Total loss floating')  # lgnd hack
@@ -196,47 +366,15 @@ def timeSeriesPlots(year, plotData, summaryData):
         for ax in axesTS:
             ax.legend()
     # Plot total loss (after others to allow legend hack)
-    axesTS[2].plot(t, summaryData['DVF'][-1]/1e9, 'cd', label='Floating loss')
-    axesTS[2].plot(t, summaryData['DVG'][-1]/1e9, 'md', label='Grounded loss')
+    if len(summaryData['deltaVF']) > 1:
+        axesTS[2].plot(t, summaryData['DVF'][-2]/1e9, 'cd',
+                       label='Floating loss')
+        axesTS[2].plot(t, summaryData['DVG'][-2]/1e9, 'md',
+                       label='Grounded loss')
     if plotData['plotResult']:
         plt.draw()
         plt.pause(1.)
         plotData['figTS'].canvas.draw()
-
-
-def computeSummaryData(SD, h, hLast, s, u, melt, grounded, floating, year, Q,
-                       mesh, beginTime):
-    ''' Compute summary results and sort in summaryData
-        Save all as float for yaml output
-    '''
-    if year % SD['dTsum'] > .0001 * year or year < SD['dTsum']:
-        return False
-    #
-    print(f'year {year} runtime {datetime.now() - beginTime}')
-    #
-    gArea = firedrake.assemble(grounded * firedrake.dx(mesh))
-    SD['year'].append(float(year))
-    SD['gArea'].append(float(gArea))
-    SD['fArea'].append(float(SD['area'] - gArea))
-    deltaVF, deltaVG, DVF, DVG = \
-        volumeChange(grounded, floating, h, hLast, SD['DVF'][-1],
-                     SD['DVG'][-1], SD['dTsum'], mesh)
-    #
-    SD['deltaVF'].append(float(deltaVF))
-    SD['deltaVG'].append(float(deltaVG))
-    SD['DVF'].append(float(DVF))
-    SD['DVG'].append(float(DVG))
-    #
-    Umax = float(u.dat.data_ro.max())
-    SD['Umax-U0'].append(float(Umax - SD['U0max']))
-    #
-    meltTot = firedrake.assemble(icepack.interpolate(floating * melt, Q) *
-                                 firedrake.dx(mesh))
-    SD['meltTot'].append(float(meltTot))
-    #
-    print(f'{year}: Initial melt {SD["meltTot"][0] / 1e9:.2f} current melt '
-          f' {meltTot / 1e9:.2f}')
-    return True
 
 
 def setupMapPlots(plotData, first=False):
@@ -353,24 +491,6 @@ def initialState(h0, s0, u0, zb, grounded0, floating0, Q):
     return h, hLast, s, u, zF, grounded, floating
 
 
-def initSummary(grounded0, floating0, h0, u0, meltModel, meltParams, Q, mesh):
-    ''' Compute intiplt.paual areas and summary data
-    '''
-    area = firedrake.assemble(firedrake.Constant(1) * firedrake.dx(mesh))
-    gArea0 = firedrake.assemble(grounded0 * firedrake.dx(mesh))
-    fArea0 = area - gArea0
-    Umax0 = u0.dat.data_ro.max()
-    melt = meltModel(h0, floating0, meltParams, Q, u0)
-    meltTot = firedrake.assemble(icepack.interpolate(floating0 * melt, Q) *
-                                 firedrake.dx(mesh))
-    summaryData = {'year': [0], 'DVG': [0], 'DVF': [0], 'deltaVF': [0],
-                   'deltaVG': [0], 'gArea': [float(gArea0)],
-                   'fArea': [float(fArea0)], 'meltTot': [float(meltTot)],
-                   'area': float(area), 'U0max': float(Umax0), 'Umax-U0': [0],
-                   'dTsum': 1.}
-    return summaryData
-
-
 def setupFriction(forwardParams):
     ''' Error check and return friction law specified by forwardParams
     '''
@@ -409,7 +529,7 @@ def setupMelt(forwardParams):
     return meltModel, meltParams
 
 
-def setupOutputs(forwardParams, inversionParams, check=True):
+def setupOutputs(forwardParams, inversionParams, meltParams, check=True):
     ''' Make output dir and dump forward and inversionParams
     '''
     if not os.path.exists(forwardParams['forwardResultDir']):
@@ -420,28 +540,19 @@ def setupOutputs(forwardParams, inversionParams, check=True):
     #
     with open(inputsFile, 'w') as fpYaml:
         myDicts = {'forwardParams': forwardParams,
-                   'inversionParams': inversionParams}
+                   'inversionParams': inversionParams,
+                   'meltParams': meltParams}
         yaml.dump(myDicts, fpYaml)
     # open check point file
     chkFile = f'{forwardParams["forwardResultDir"]}/' \
               f'{forwardParams["forwardResult"]}.history'
     if check:
-        return firedrake.DumbCheckpoint(chkFile, mode=firedrake.FILE_CREATE)
+        if forwardParams['restart']:
+            mode = firedrake.FILE_UPDATE
+        else:
+            mode = firedrake.FILE_CREATE
+        return firedrake.DumbCheckpoint(chkFile, mode=mode)
     return None
-
-
-def saveSummaryData(forwardParams, summaryData):
-    ''' Write summary data to yaml file
-    '''
-    summaryFile = f'{forwardParams["forwardResultDir"]}/' \
-                  f'{forwardParams["forwardResult"]}.summary.yaml'
-    # Convert numpy to list
-    for s in summaryData:
-        if isinstance(summaryData[s], np.ndarray):
-            summaryData[s] = summaryData[s].tolist()
-    # Now write result to yaml
-    with open(summaryFile, 'w') as fpYaml:
-        yaml.dump({'summaryFile': summaryData}, fpYaml)
 
 
 def outputTimeStep(t, chk,  **kwargs):
@@ -454,13 +565,15 @@ def outputTimeStep(t, chk,  **kwargs):
 
 def readSMB(SMBfile, Q):
     ''' Read SMB file an limit values to +/- 6 to avoid no data values
+
+    Returns water equivalent values.
     '''
     if not os.path.exists:
         myerror(f'readSMB: SMB file  ({SMBfile}) does not exist')
     SMB = mf.getModelVarFromTiff(SMBfile, Q)
     # avoid any unreasonably large value
     SMB = icepack.interpolate(
-        firedrake.max_value(firedrake.min_value(SMB * 1./0.917, 6), -6), Q)
+        firedrake.max_value(firedrake.min_value(SMB, 6), -6), Q)
     return SMB
 
 
@@ -475,7 +588,8 @@ def mapPlots(plotData, t, melt, floating, h, hLast, Q):
     '''
     setupMapPlots(plotData)
     axes = plotData['axesM'].flatten()
-    meltC = icepack.plot.tricontourf(melt, levels=np.linspace(-150, 0, 151),
+    meltC = icepack.plot.tricontourf(icepack.interpolate(melt, Q),
+                                     levels=np.linspace(-150, 0, 151),
                                      extend='both', axes=axes[0])
     floatC = icepack.plot.tricontourf(floating, axes=axes[1], extend='both',
                                       levels=np.linspace(0, 1, 106))
@@ -486,7 +600,7 @@ def mapPlots(plotData, t, melt, floating, h, hLast, Q):
                                      cmap=plt.get_cmap('bwr_r'))
     plotData['figM'].suptitle(f'Simulation Year: {t:0.1f}')
     if plotData['figMColorbar']:
-        titles = ['melt (m/yr)', 'betaScale', 'dH/dt (m/yr)']
+        titles = ['melt (m/yr)', 'floating', 'dH/dt (m/yr)']
         for ax, cont, title in zip(axes, [meltC, floatC, thinC], titles):
             myColorBar(plotData['figM'], ax, cont)
             ax.set_title(title)
@@ -497,7 +611,7 @@ def mapPlots(plotData, t, melt, floating, h, hLast, Q):
     # plt.pause(0.01)
 
 
-def combineA(A, theta, floating, grounded, forwardParams):
+def combineA(A, theta, floating, grounded, forwardParams, Q):
     '''
     '''
     if forwardParams['GLTaper'] > 0:
@@ -508,7 +622,8 @@ def combineA(A, theta, floating, grounded, forwardParams):
                                             alpha=forwardParams['GLTaper'])
         AForward = A * groundedSmooth + floatingSmooth * firedrake.exp(theta)
     else:
-        AForward = A * grounded + floating * firedrake.exp(theta)
+        AForward = icepack.interpolate(A * grounded +
+                                       floating * firedrake.exp(theta), Q)
     return AForward
 
 
@@ -526,20 +641,42 @@ def savePlots(plotData, forwardParams):
                 plt.close(plotData[figKey])
 
 
+def meltAnomaly(y, forwardParams):
+    '''
+    Compute melt anomaly as 1 + meltAnomaly * sin(t/meltPeriod)
+    Parameters
+    ----------
+    y: float
+        year of simumlation
+    forwardParams : dict
+        forward params.
+    Returns
+    -------
+    melt scale factor.
+    '''
+    meltScale = 1.
+    if forwardParams['meltPeriod'] is not None:
+        meltScale += forwardParams['meltAnomaly'] * \
+            np.sin(y/forwardParams['meltPeriod'] * 2.0 * np.pi)
+    return firedrake.Constant(meltScale)
+
+
 def main():
     # declare globals - fix later
     # global mesh, floatingG, groundedG
+    waterToIce = 1./0.917
     forwardParams, inversionParams = parsePigForwardArgs()
     #
     # Read mesh and setup function spaces
-    mesh, Q, V, meshOpts = mf.setupMesh(forwardParams['mesh'],
-                                        degree=forwardParams['degree'])
+    mesh, Q, V, meshOpts = \
+        mf.setupMesh(forwardParams['mesh'], degree=forwardParams['degree'],
+                     meshOversample=inversionParams['meshOversample'])
     opts = {}
     opts['dirichlet_ids'] = meshOpts['dirichlet_ids']  # Opts from mesh
     #
     beta0, theta0, A, s0, h0, zb, floating0, grounded0, uInv, uObs = \
         mf.getInversionData(forwardParams['inversionResult'], Q, V)
-    AForward = combineA(A, theta0, floating0, grounded0, forwardParams)
+    AForward = combineA(A, theta0, floating0, grounded0, forwardParams, Q)
     SMB = readSMB(forwardParams['SMB'], Q)
     meltModel, meltParams = setupMelt(forwardParams)
     # Setup ice stream model
@@ -548,18 +685,31 @@ def main():
     forwardModel = icepack.models.IceStream(friction=frictionLaw)
     forwardSolver = icepack.solvers.FlowSolver(forwardModel, **opts)
     # initial solve
-
     u0 = forwardSolver.diagnostic_solve(velocity=uObs, thickness=h0,
                                         surface=s0, fluidity=AForward,
                                         beta=beta0, grounded=grounded0,
                                         floating=floating0,
                                         uThresh=forwardParams['uThresh'])
+    # hack until API updated.
+    forwardSolver._diagnostic_solver.max_iterations = 150
+    #
+    chk = setupOutputs(forwardParams, inversionParams, meltParams)
+    deltaT = forwardParams['deltaT']
     # copy original state
-    h, hLast, s, u, zF, grounded, floating = \
-        initialState(h0, s0, u0, zb, grounded0, floating0, Q)
+    if not forwardParams['restart']:
+        startYear = 0
+        h, hLast, s, u, zF, grounded, floating = \
+            initialState(h0, s0, u0, zb, grounded0, floating0, Q)
+    else:  # load state to restart
+        startYear, h, hLast, s, u, zF, grounded, floating = \
+            doRestart(forwardParams, zb, deltaT, chk, Q, V)
+        print(type(s))
+        print(type(u))
+        print(f'restarting at {startYear}')
     # meltParams['meltMask'] =  icepack.interpolate(h0 > 400, Q)
     summaryData = initSummary(grounded0, floating0, h0, u0, meltModel,
-                              meltParams, Q, mesh)
+                              meltParams,  SMB, Q, mesh, forwardParams,
+                              restart=forwardParams['restart'])
     # Sanity/consistency check
     velocityError(u0, uInv, summaryData['area'], 'Difference with inversion')
     velocityError(u0, uObs, summaryData['area'], 'Difference with Obs')
@@ -571,24 +721,28 @@ def main():
     setupMapPlots(plotData, first=True)
     profilePlots(-1e-12, plotData, uObs, s0, h0, zb, zF, None, Q, first=True)
     #
-    chk = setupOutputs(forwardParams, inversionParams)
-    #
     beginTime = datetime.now()
-    deltaT = forwardParams['deltaT']
+
     tBetaScale = 0  # FIXE  TEMPORARY
     betaScale = grounded * 1
     beta = beta0
-    for t in np.arange(0, forwardParams['nYears'] + deltaT, deltaT):
+    print('Loop')
+    if startYear > forwardParams['nYears']:
+        myerror(f'startYear ({startYear}) is greater than nYears '
+                f'({forwardParams["nYears"]}). Restart '
+                f'{forwardParams["nYears"]} so sim may be done')
+    for t in np.arange(startYear, forwardParams['nYears'] + deltaT, deltaT):
         #
-        melt = meltModel(h, floating, meltParams, Q, u)
-        a = icepack.interpolate(SMB + melt, Q)
-        if forwardParams['prognosticOnly']:
-            u = uObs
+        melt = meltModel(h, floating, meltParams, Q, u) * \
+            meltAnomaly(t, forwardParams)
+        a = icepack.interpolate((SMB + melt) * waterToIce, Q)
+        #
         h = forwardSolver.prognostic_solve(forwardParams['deltaT'],
                                            thickness=h, velocity=u,
                                            accumulation=a,
                                            thickness_inflow=h0)
-        h = icepack.interpolate(firedrake.max_value(10, h), Q)
+        # Don't allow to go too thin.
+        h = icepack.interpolate(firedrake.max_value(30, h), Q)
         # Compute surface and masks
         s = computeSurface(h, zb, Q)
         floating, grounded = mf.flotationMask(s, zF, Q)
@@ -597,7 +751,7 @@ def main():
             betaScale = mf.reduceNearGLBeta(s, s0, zF, grounded, Q,
                                             forwardParams['GLThresh'])
             # print(betaScale.dat.data_ro.max())
-            beta = beta0 * betaScale
+            beta = icepack.interpolate(beta0 * betaScale, Q)
         else:
             beta = beta0
         u = forwardSolver.diagnostic_solve(velocity=u, thickness=h, surface=s,
@@ -606,21 +760,17 @@ def main():
                                            floating=floating,
                                            grounded=grounded)
         print('.', end='', flush=True)
-        myDiv = firedrake.div(u * h)
-        fDiv = firedrake.assemble(myDiv * floating * firedrake.dx)
-        gDiv = firedrake.assemble(myDiv * grounded * firedrake.dx)
-        Af = firedrake.assemble(a * floating * firedrake.dx)
-        Ag = firedrake.assemble(a * grounded * firedrake.dx)
-        print(gDiv * 1e-9, (Ag - gDiv )*(0.917)*1e-9  )
         #
-        if computeSummaryData(summaryData, h, hLast, s, u, melt, grounded,
-                              floating, t, Q, mesh, beginTime):
+        if computeSummaryData(summaryData, h, hLast, s, u, a, melt, SMB,
+                              grounded, floating, t, Q, mesh, deltaT,
+                              beginTime):
             if plotData['plotResult']:  # Only do final plot (below)
                 mapPlots(plotData, t, melt, betaScale, h, hLast, Q)
             hLast = h.copy(deepcopy=True)  # Save for next summary calc
             # For now ouput fields at same interval as summary data
             outputTimeStep(t, chk,  h=h, s=s, u=u, grounded=grounded,
                            floating=floating)
+            saveSummaryData(forwardParams, summaryData, tmp=True)
         #
         timeSeriesPlots(t, plotData, summaryData)
         profilePlots(t, plotData, u, s, h, zb, zF, melt, Q)
