@@ -172,6 +172,8 @@ def parseForwardParams(parser, defaults):
                     ' inversion result')
     if forwardParams['GLThresh'] is None:
         forwardParams['GLThresh'] = GLThreshDefaults[forwardParams['friction']]
+    # for param in ['uThresh']:
+    #    forwardParams[param] = firedrake.Constant(forwardParams[param])
     return forwardParams, inversionParams
 
 
@@ -583,6 +585,7 @@ def setupOutputs(forwardParams, inversionParams, meltParams, check=True):
         myDicts = {'forwardParams': forwardParams,
                    'inversionParams': inversionParams,
                    'meltParams': meltParams}
+        print
         yaml.dump(myDicts, fpYaml)
     # open check point file
     if check:
@@ -772,11 +775,15 @@ def main():
     opts['diagnostic_solver_parameters'] = {'max_iterations': 150}
     forwardSolver = icepack.solvers.FlowSolver(forwardModel, **opts)
     # initial solve
+    # for x in [uObs, h0, s0, AForward, beta0, grounded0, floating0,
+    #          forwardParams['uThresh']]:
+    #    print(type(x))
+    uThresh = firedrake.Constant(forwardParams['uThresh'])
     u0 = forwardSolver.diagnostic_solve(velocity=uObs, thickness=h0,
                                         surface=s0, fluidity=AForward,
                                         beta=beta0, grounded=grounded0,
                                         floating=floating0,
-                                        uThresh=forwardParams['uThresh'])
+                                        uThresh=uThresh)
     # Get fresh or reloaded summary data - reset restart if not data
     summaryData = initSummary(grounded0, floating0, h0, u0, meltModel,
                               meltParams,  SMB, Q, mesh, forwardParams)
@@ -835,9 +842,10 @@ def main():
             beta = icepack.interpolate(beta0 * betaScale, Q)
         else:
             beta = beta0
+        uThresh = firedrake.Constant(forwardParams['uThresh'])
         u = forwardSolver.diagnostic_solve(velocity=u, thickness=h, surface=s,
                                            fluidity=AForward, beta=beta,
-                                           uThresh=forwardParams['uThresh'],
+                                           uThresh=uThresh,
                                            floating=floating,
                                            grounded=grounded)
         print('.', end='', flush=True)

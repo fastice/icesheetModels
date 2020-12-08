@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import argparse
-from utilities import myerror
+from modelfunc import myerror
 import modelfunc as mf
 import firedrake
 import icepack
@@ -690,9 +690,12 @@ def main():
     thetaFinal = theta
     if inversionParams['solveViscosity']:
         thetaFinal = solverTheta.parameter
+    betaFinal = beta
+    if inversionParams['solveBeta']:
+        betaFinal = solverBeta.parameter
     uFinal = solver.diagnostic_solve(velocity=uObs, thickness=h, surface=s,
                                      fluidity=A, theta=thetaFinal,
-                                     beta=solverBeta.parameter,
+                                     beta=betaFinal,
                                      grounded=grounded, floating=floating,
                                      uThresh=inversionParams['uThresh'])
     velocityError(uObs, uFinal, area, message='Final error')
