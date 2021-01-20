@@ -30,6 +30,8 @@ floatingG, groundedG, mesh = None, None, None
 GLThreshDefaults = {'schoof': 41, 'weertman': 122}
 
 
+# ----- Parse command and input file arguments -----
+
 def parsePigForwardArgs():
     ''' Handle command line args'''
     defaults = {'geometry': 'PigGeometry.yaml',
@@ -644,7 +646,7 @@ def meltTrend(y, forwardParams):
 
 def taperedViscosity(velocity, thickness, fluidity, theta,
                      groundedSmooth, floatingSmooth):
-    ''' This is a test version to use feathered grouning to floating transition
+    ''' This version uses feathered grouning to floating transition
     '''
     # Combine tapered A on grouned and theta for smooth
     A = groundedSmooth * fluidity + floatingSmooth * firedrake.exp(theta)
