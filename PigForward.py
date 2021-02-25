@@ -29,7 +29,6 @@ floatingG, groundedG, mesh = None, None, None
 # on ice streams other than PIG.
 GLThreshDefaults = {'schoof': 41, 'weertman': 122}
 
-
 # ----- Parse command and input file arguments -----
 
 def parsePigForwardArgs():
@@ -65,6 +64,9 @@ def parsePigForwardArgs():
     parser.add_argument('--geometry', type=str, default=None,
                         help=f'Yaml file with geometry file info '
                         f'[{defaults["geometry"]}] ')
+    parser.add_argument('--SMB', type=str, default=None,
+                        help=f'Geotiff with SMB data '
+                        f'[{defaults["SMB"]}] ')
     parser.add_argument('--degree', type=int, default=None,
                         choices=[1, 2], help='Degree for mesh ')
     parser.add_argument('--nYears', type=float, default=None,
