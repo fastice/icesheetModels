@@ -670,7 +670,11 @@ def main():
     if inversionParams['initWithDeg1']:
         Q1 = firedrake.FunctionSpace(mesh, family='CG', degree=1)
     area = firedrake.assemble(firedrake.Constant(1) * firedrake.dx(mesh))
-    opts = {'dirichlet_ids': meshOpts['dirichlet_ids']}  # Opts from mesh
+    opts = {
+        'dirichlet_ids': meshOpts['dirichlet_ids'],  ## Opts from mesh
+        'diagnostic_solver_parameters': {'max_iterations': 100}
+    }
+
     #
     # Input model geometry and velocity
     zb, s, h, floating, grounded = \
