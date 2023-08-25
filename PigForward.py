@@ -12,11 +12,12 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 import icepack.plot
 import icepack.models
-from firedrake import PETSc
+# from firedrake import PETSc
 import numpy as np
 import yaml
 import os
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+import warnings
 
 rhoW = rhoI * 1028./917.  # This ensures rhoW based on 1028
 waterToIce = 1000./917.
@@ -30,6 +31,7 @@ floatingG, groundedG, mesh = None, None, None
 GLThreshDefaults = {'schoof': 41, 'weertman': 122}
 
 # ----- Parse command and input file arguments -----
+
 
 def parsePigForwardArgs():
     ''' Handle command line args'''
@@ -56,7 +58,9 @@ def parsePigForwardArgs():
                 'profileFile': '/Volumes/UsersIan/ModelExperiments/'
                 'PigForward/llprof/piglong.xy',
                 'mapPlotLimits': {'xmin': -1.66e6, 'xmax': -1.51e6,
-                                  'ymin': -3.50e5, 'ymax': -2.30e5}
+                                  'ymin': -3.50e5, 'ymax': -2.30e5},
+                'meltRegionsFile': None,
+                'meltRegions': None
                 }
     parser = argparse.ArgumentParser(
         description='\n\n\033[1mRun a forward simulation initialized by an '
@@ -82,6 +86,8 @@ def parsePigForwardArgs():
     parser.add_argument('--meltParamsFile', type=str, default=None,
                         help='Yaml file with melt params'
                         f'[{defaults["meltParamsFile"]}]')
+    parser.add_argument('--meltRegionsFile', type=str, default=None,
+                        help='File specifying melt regions [None]')
     parser.add_argument('--meltAnomaly', type=rangeLimitedFloatType,
                         default=None, help='Amplitude of melt anomaly as '
                         f'fraction of mean [{defaults["meltAnomaly"]}]')
@@ -116,10 +122,10 @@ def parsePigForwardArgs():
                         help='Base name forward output')
     #
     forwardParams, inversionParams = parseForwardParams(parser, defaults)
-    PETSc.Sys.Print('\n\n**** FORWARD MODEL PARAMS ****')
+    print('\n\n**** FORWARD MODEL PARAMS ****')
     for key in forwardParams:
-        PETSc.Sys.Print(f'{key}: {forwardParams[key]}')
-    PETSc.Sys.Print('**** END MODEL PARAMS ****\n')
+        print(f'{key}: {forwardParams[key]}')
+    print('**** END MODEL PARAMS ****\n')
     #
 
     return forwardParams, inversionParams
@@ -179,6 +185,15 @@ def parseForwardParams(parser, defaults):
         forwardParams['GLThresh'] = GLThreshDefaults[forwardParams['friction']]
     # for param in ['uThresh']:
     #    forwardParams[param] = firedrake.Constant(forwardParams[param])
+    #
+    summaryFile = f'{forwardParams["forwardResultDir"]}/' \
+                  f'{forwardParams["forwardResult"]}.summary.yaml.tmp'
+    #
+    if not os.path.exists(summaryFile):
+        mywarning(f'Cannot reinit with tmp summary {summaryFile}\n'
+                  'Starting from scratch')
+        forwardParams['restart'] = False
+    #
     return forwardParams, inversionParams
 
 # ----- Plot Stuff -----
@@ -283,11 +298,11 @@ def timeSeriesPlots(year, plotData, summaryData):
         plotData['figTS'].canvas.draw()
 
 
-def setupProfilePlots(plotData, forwardParams, h):
+def setupProfilePlots(plotData, forwardParams, h, skip=False):
     ''' Setup axes for times series plots
     '''
     # If profile doesn't exist, return
-    if not os.path.exists(forwardParams['profileFile']):
+    if not os.path.exists(forwardParams['profileFile']) or skip:
         plotData['figP'], plotData['axesP'] = None, None
         return
     #
@@ -473,22 +488,15 @@ def reinitSummary(forwardParams):
     return mp['summaryFile']
 
 
-def doRestart(forwardParams, zb, deltaT, chk, Q, V):
+def doRestart(startIdx, mesh, forwardParams, zb, deltaT, chk, Q, V):
     ''' Read in last state to restart simulation and regenerate summary data
     '''
-    tSteps, index = chk.get_timesteps()
-    # Assumes yearly updates
-    t = round(tSteps[-1], 0)
-    chk.set_timestep(t, idx=index[-1])
+    t = startIdx
+    # chk.set_timestep(t, idx=index[-1])
     myVars = {}
-    for varName in ['h', 's', 'floating', 'grounded']:
-        myVar = firedrake.Function(Q, name=varName)
-        chk.load(myVar, name=varName)
-        myVars[varName] = myVar
+    for varName in ['h', 's', 'floating', 'grounded', 'u']:
+        myVars[varName] = chk.load_function(mesh, name=varName, idx=startIdx)
     #
-    myVar = firedrake.Function(V, name='u')
-    chk.load(myVar, name='u')
-    myVars['u'] = myVar
     zF = mf.flotationHeight(zb, Q)
     hLast = myVars['h'].copy(deepcopy=True)
     print(f'restarting at {t}')
@@ -514,7 +522,8 @@ def initSummary(grounded0, floating0, h0, u0, meltModel, meltParams, SMB, Q,
     area = firedrake.assemble(firedrake.Constant(1) * firedrake.dx(mesh))
     gArea0 = firedrake.assemble(grounded0 * firedrake.dx(mesh))
     fArea0 = area - gArea0
-    melt = meltModel(h0, floating0, meltParams, Q, u0)
+    melt = meltModel(h0, floating0, meltParams, Q, u0,
+                     meltRegions=forwardParams['meltRegions'])
     meltTot = firedrake.assemble(icepack.interpolate(floating0 * melt, Q) *
                                  firedrake.dx(mesh))
     SMBfloating = firedrake.assemble(icepack.interpolate(floating0 * SMB, Q) *
@@ -528,6 +537,7 @@ def initSummary(grounded0, floating0, h0, u0, meltModel, meltParams, SMB, Q,
                    'SMBgrounded': [float(SMBgrounded)],
                    'SMBfloating': [float(SMBfloating)],
                    'dTsum': 1.}  # dTsum fixed - code modes needed to change
+    print(summaryData)
     return summaryData
 
 
@@ -701,16 +711,15 @@ def setupOutputs(forwardParams, inversionParams, meltParams, check=True):
         myDicts = {'forwardParams': forwardParams,
                    'inversionParams': inversionParams,
                    'meltParams': meltParams}
-        print
         yaml.dump(myDicts, fpYaml)
     # open check point file
     if check:
         if forwardParams['restart']:
-            mode = firedrake.FILE_UPDATE
+            mode = 'a'
         else:
-            mode = firedrake.FILE_CREATE
-        return firedrake.DumbCheckpoint(chkFile, mode=mode)
-    return None
+            mode = 'w'
+        return firedrake.CheckpointFile(f'{chkFile}.h5', mode), chkFile
+    return None, None
 
 
 def saveSummaryData(forwardParams, summaryData, tmp=False):
@@ -743,54 +752,150 @@ def saveSummaryData(forwardParams, summaryData, tmp=False):
         yaml.dump({'summaryFile': summaryData}, fpYaml)
 
 
-def outputTimeStep(t, chk,  **kwargs):
+def outputTimeStep(idx, mesh, chk, **kwargs):
     ''' Ouput variables at a time step)
     '''
-    chk.set_timestep(t)
+    # chk.set_timestep(t)
     for k in kwargs:
-        chk.store(kwargs[k], name=k)
+        chk.save_function(kwargs[k], name=k, idx=idx)
+
+
+def printExtremes(**kwargs):
+    ''' Print min/max of firedrake functions to flag bad inputs'''
+    print('Min/Max of input values')
+    print(''.join(['-']*40))
+    for arg in kwargs:
+        print(arg, kwargs[arg].dat.data_ro.min(),
+              kwargs[arg].dat.data_ro.max())
+    print(''.join(['-']*40))
+
+
+def getMeshFromCheckPoint(checkFile):
+    '''
+    If a new checkpoint file, read the mesh from there.
+    '''
+    if '.h5' not in checkFile:
+        checkFile = f'{checkFile}.h5'
+    print(checkFile)
+
+    with firedrake.CheckpointFile(checkFile, 'r') as chk:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', category=DeprecationWarning)
+            try:
+                mesh = chk.load_mesh()
+                return mesh
+            except Exception:
+                return None
+
+
+def readChkVariables(myVars, mesh, chk):
+    '''
+    Read a list of check vars.
+    '''
+    result = []
+    for myVar in myVars:
+        result.append(chk.load_function(mesh, myVar))
+    return result
+
+
+def saveChkVariables(myVars, mesh, chk):
+    result = []
+    for myVar in myVars:
+        result.append(chk.save_function(myVars[myVar], name=myVar))
+    return result
+
+
+def loadMeltRegions(forwardParams, mesh, Q):
+    '''
+        Load the melt regions if they exist
+    '''
+    if forwardParams['meltRegionsFile'] is None:
+        return
+    meltRegionsFiles = mf.readModelParams(forwardParams['meltRegionsFile'])
+    meltRegions = {}
+    print('*** Melt Scaling ***')
+    for key in meltRegionsFiles['meltRegionFiles']:
+        print(f'Reading {meltRegionsFiles["meltRegionFiles"][key]}')
+        meltRegions[key] = mf.getModelVarFromTiff(
+            meltRegionsFiles['meltRegionFiles'][key], Q)
+    forwardParams['meltRegions'] = meltRegions
 
 
 # ----- Main ----
+
+
 def main():
     ''' Main for foward model simulation '''
     forwardParams, inversionParams = parsePigForwardArgs()
-    print(forwardParams)
-    #
-    # Read mesh and setup function spaces
-    mesh, Q, V, meshOpts = \
-        mf.setupMesh(forwardParams['mesh'], degree=forwardParams['degree'],
-                     meshOversample=inversionParams['meshOversample'])
-    beta0, theta0, A0, s0, h0, zb, floating0, grounded0, uInv, uObs = \
-        mf.getInversionData(forwardParams['inversionResult'], Q, V)
-    # Compute masks for combining A0 with theta0
-    groundedSmooth, floatingSmooth = setupTaperedMasks(inversionParams,
-                                                       grounded0, floating0)
-    SMB = readSMB(forwardParams['SMB'], Q)
     #
     meltModel, meltParams = setupMelt(forwardParams)
+    #
+    chk, chkFile = setupOutputs(forwardParams, inversionParams, meltParams)
+    if not forwardParams['restart']:
+        meshI = getMeshFromCheckPoint(forwardParams['inversionResult'])
+    else:
+        meshI = chk.load_mesh()
+        print(meshI)
+    #
+    mesh, Q, V, meshOpts = \
+        mf.setupMesh(forwardParams['mesh'], degree=forwardParams['degree'],
+                     meshOversample=inversionParams['meshOversample'],
+                     newMesh=meshI)
+    print(mesh)
+    #
     # Setup ice stream model
     frictionLaw = setupFriction(forwardParams)
     #
     forwardModel = icepack.models.IceStream(friction=frictionLaw,
                                             viscosity=taperedViscosity)
     opts = {'dirichlet_ids': meshOpts['dirichlet_ids'],
-            'diagnostic_solver_parameters': {'max_iterations': 150}}
+            'diagnostic_solver_parameters': {'max_iterations': 150,
+                                             'tolerance': 1e-10}}
     forwardSolver = icepack.solvers.FlowSolver(forwardModel, **opts)
-    # initial solve
     uThresh = firedrake.Constant(forwardParams['uThresh'])
-    u0 = forwardSolver.diagnostic_solve(velocity=uObs, thickness=h0,
-                                        surface=s0, fluidity=A0,
-                                        beta=beta0, theta=theta0,
-                                        grounded=grounded0, floating=floating0,
-                                        groundedSmooth=groundedSmooth,
-                                        floatingSmooth=floatingSmooth,
-                                        uThresh=uThresh)
+    #
+    initVarNames = ['beta0', 'theta0', 'A0', 's0', 'h0', 'zb', 'floating0',
+                    'grounded0', 'uInv', 'uObs', 'groundedSmooth',
+                    'floatingSmooth', 'SMB', 'u0']
+    # Load melt regions if they exist
+    loadMeltRegions(forwardParams, mesh, Q)
+    #
+    print(f'Restart status {forwardParams["restart"]}')
+    #
+    # Read mesh and setup function spaces
+    if not forwardParams['restart']:
+        #
+        chk.save_mesh(mesh)
+        beta0, theta0, A0, s0, h0, zb, floating0, grounded0, uInv, uObs = \
+            mf.getInversionData(forwardParams['inversionResult'], Q, V,
+                                mesh=mesh)
+        # Compute masks for combining A0 with theta0
+        groundedSmooth, floatingSmooth = \
+            setupTaperedMasks(inversionParams, grounded0, floating0)
+        SMB = readSMB(forwardParams['SMB'], Q)
+        # initial solve
+        u0 = forwardSolver.diagnostic_solve(velocity=uObs, thickness=h0,
+                                            surface=s0, fluidity=A0,
+                                            beta=beta0, theta=theta0,
+                                            grounded=grounded0,
+                                            floating=floating0,
+                                            groundedSmooth=groundedSmooth,
+                                            floatingSmooth=floatingSmooth,
+                                            uThresh=uThresh)
+        initVar = dict(zip(initVarNames,
+                           [beta0, theta0, A0, s0, h0, zb, floating0,
+                            grounded0, uInv, uObs, groundedSmooth,
+                            floatingSmooth, SMB, u0]))
+        saveChkVariables(initVar, mesh, chk)
+    else:
+        beta0, theta0, A0, s0, h0, zb, floating0, \
+            grounded0, uInv, uObs, groundedSmooth, \
+            floatingSmooth, SMB, u0 = readChkVariables(initVarNames, mesh, chk)
+    #
     # Get fresh or reloaded summary data - reset restart if not data
     summaryData = initSummary(grounded0, floating0, h0, u0, meltModel,
                               meltParams,  SMB, Q, mesh, forwardParams)
     #
-    chk = setupOutputs(forwardParams, inversionParams, meltParams)
     deltaT = forwardParams['deltaT']
     # copy original state
     if not forwardParams['restart']:
@@ -798,20 +903,25 @@ def main():
         h, hLast, s, u, zF, grounded, floating = \
             initialState(h0, s0, u0, zb, grounded0, floating0, Q)
     else:  # load state to restart
+        startIdx = int(summaryData['year'][-1])
+        if startIdx < 1:
+            myerror(f"Could not get start year for restart: {startIdx}")
         startYear, h, hLast, s, u, zF, grounded, floating = \
-            doRestart(forwardParams, zb, deltaT, chk, Q, V)
+            doRestart(startIdx, mesh, forwardParams, zb, deltaT, chk, Q, V)
+    #
     # Sanity/consistency check
     print(f'area {summaryData["area"]}')
     mf.velocityError(u0, uInv, summaryData['area'], 'Difference with uInv')
     mf.velocityError(u0, uObs, summaryData['area'], 'Difference with uObs')
-    mf.velocityError(uInv, uObs, summaryData['area'], 'Difference with uInv/uObs')
+    mf.velocityError(uInv, uObs, summaryData['area'],
+                     'Difference with uInv/uObs')
     # setup plots
     plotData = {'plotResult': forwardParams['plotResult'],
                 'mapPlotLimits': forwardParams['mapPlotLimits'],
                 'figM': None, 'axesM': None}
     setupTimesSeriesPlots(plotData, forwardParams)
-    setupProfilePlots(plotData, forwardParams, h)
-    profilePlots(-1e-12, plotData, uObs, s0, h0, zb, zF, None, Q, first=True)
+    setupProfilePlots(plotData, forwardParams, h, skip=True)
+    # profilePlots(-1e-12, plotData, uObs, s0, h0, zb, zF, None, Q, first=True)
     #
     beginTime = datetime.now()
     betaScale = grounded * 1
@@ -826,8 +936,11 @@ def main():
         #
         hLast = h.copy(deepcopy=True)  # Save for next summary calc
         trend = meltTrend(t, forwardParams)
-        melt = meltModel(h, floating, meltParams, Q, u, trend=trend) * \
+        melt = meltModel(h, floating, meltParams, Q, u,
+                         trend=trend,
+                         meltRegions=forwardParams['meltRegions']) * \
             meltAnomaly(t, forwardParams)
+        # exit()
         a = icepack.interpolate((SMB + melt) * waterToIce, Q)
         #
         h = forwardSolver.prognostic_solve(forwardParams['deltaT'],
@@ -864,12 +977,13 @@ def main():
             if plotData['plotResult']:  # Only do final plot (below)
                 mapPlots(plotData, t, melt, betaScale, h, hLast, deltaT, Q)
             # For now ouput fields at same interval as summary data
-            outputTimeStep(t, chk,  h=h, s=s, u=u, grounded=grounded,
-                           floating=floating)
+            outputTimeStep(int(np.round(t)), mesh, chk,  h=h, s=s, u=u,
+                           grounded=grounded, floating=floating)
+            # write after h5 so last year recorded
             saveSummaryData(forwardParams, summaryData, tmp=True)
         #
         timeSeriesPlots(t, plotData, summaryData)
-        profilePlots(t, plotData, u, s, h, zb, zF, melt, Q)
+        # profilePlots(t, plotData, u, s, h, zb, zF, melt, Q)
     #
     # End Simulation so save results
     mapPlots(plotData, t, melt, betaScale, h, hLast, deltaT, Q)

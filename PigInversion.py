@@ -15,12 +15,12 @@ from icepack.constants import weertman_sliding_law as m
 import matplotlib.pyplot as plt
 import icepack.plot
 import icepack.models
-from firedrake import PETSc
+#from firedrake import PETSc
 import numpy as np
 import yaml
 
 
-Print = PETSc.Sys.Print
+Print = print #PETSc.Sys.Print
 
 
 # ---- Parse Command Line ----
@@ -75,6 +75,8 @@ def setupPigInversionArgs():
     parser.add_argument('--solverMethod', type=str, default=None,
                         choices=["GaussNewton", "BFGS"],
                         help=f'Friction law [{defaults["friction"]}]')
+    parser.add_argument('--solverTolerance', type=float, default=1e-6,
+                        help=f'Tolerance for solver')
     parser.add_argument('--maxSteps', type=int, default=None,
                         help=f'Max steps for inversion '
                         f'[{defaults["maxSteps"]}]')
@@ -142,7 +144,8 @@ def parseInversionParams(parser, defaults):
     #
     inversionParams['inversionResult'] = inversionParams['inversionResult'][0]
     # Handle conflicts
-    if inversionParams['maxSteps'] <= 0 or inversionParams['rtol'] <= 0.:
+    if inversionParams['maxSteps'] <= 0 or inversionParams['rtol'] <= 0. or \
+            inversionParams['solverTolerance'] <= 0:
         myerror(f'maxSteps ({args.maxSteps}) and rtol {args.rtol} must be > 0')
     if inversionParams['degree'] == 1 and inversionParams['initWithDeg1']:
         myerror('degree=1 not compatible with initWithDeg1')
@@ -241,6 +244,7 @@ def defineProblemBeta(beta, model, uObs, h, s, u, A, theta, grounded, floating,
     """Define problem for friction inversion
     """
     # Convert params to firedrake constants
+    print(inversionParams['solverTolerance'])
     uThresh = firedrake.Constant(inversionParams['uThresh'])
     regBeta = firedrake.Constant(inversionParams['regBeta'])
     # Define problem
@@ -257,8 +261,10 @@ def defineProblemBeta(beta, model, uObs, h, s, u, A, theta, grounded, floating,
                                  'floating': floating, 'uThresh': uThresh,
                                  'groundedSmooth': groundedSmooth,
                                  'floatingSmooth': floatingSmooth},
-        solver_kwargs={**opts, 'tolerance': 1e-6,
-                       'diagnostic_solver_parameters': {'snes_max_it': 200}}
+        solver_kwargs={**opts, 'tolerance': inversionParams['solverTolerance'],
+                       'max_iterations': 203,
+                       'diagnostic_solver_parameters': {'snes_max_it': 200,
+                                                        'max_iterations': 206}}
     )
     return problem
 
@@ -285,8 +291,10 @@ def defineProblemTheta(theta, model, uObs, h, s, u, A, beta, grounded,
                                  'floating': floating, 'uThresh': uThresh,
                                  'groundedSmooth': groundedSmooth,
                                  'floatingSmooth': floatingSmooth},
-        solver_kwargs={**opts, 'tolerance': 1e-6,
-                       'diagnostic_solver_parameters': {'snes_max_it': 200}}
+        solver_kwargs={**opts, 'tolerance': inversionParams['solverTolerance'],
+                       'max_iterations': 201,
+                       'diagnostic_solver_parameters': {'snes_max_it': 200,
+                                                        'max_iterations': 205}}
     )
     return problem
 
@@ -307,7 +315,9 @@ def setupSolvers(thickness, surface, velocity, uObs, fluidity, grounded,
                                         sigmaX, sigmaY,
                                         inversionParams, opts)
         solverBeta = solverMethod(problemBeta, makeStepInfo(mesh),
-                                  search_max_iterations=300)
+                                  search_max_iterations=500,
+                                  search_tolerance=
+                                  inversionParams['solverTolerance'])
     #
     # Set up problem for theta
     solverTheta = None
@@ -319,8 +329,9 @@ def setupSolvers(thickness, surface, velocity, uObs, fluidity, grounded,
                                           sigmaX, sigmaY,
                                           inversionParams, opts)
         solverTheta = solverMethod(problemTheta, makeStepInfo(mesh),
-                                   search_max_iterations=300)
-        #                           search_tolerance=1e-6)
+                                   search_max_iterations=500,
+                                   search_tolerance=
+                                   inversionParams['solverTolerance'])
     return solverBeta, solverTheta
 
 # ----- Objective/Regularization Functions
@@ -520,6 +531,7 @@ def solverStep(solver, solverAlt, area, JLast, uObs, solverName, altName,
     Print(f' {datetime.now()-invertTime} min/max '
           f'{solver.parameter.dat.data_ro.min():10.3f} '
           f'{solver.parameter.dat.data_ro.max():10.3f}')
+    Print(f'JLast={JLast}, J={J}')
     Print(f'Convergence test {JLast - J:10.3e}'
           f' {rtol * JLast:10.3e} {invertTime.strftime("%H:%M:%S")}')
     # Check for convergence
@@ -598,16 +610,14 @@ def plotResults(solverBeta, solverTheta, uObs, uFinal, inversionParams, Q):
     plt.show()
 
 
-# ---- Output ----
-
-
-def saveInversionResult(inversionParams, modelResults, solverBeta,
+def saveInversionResult(mesh, inversionParams, modelResults, solverBeta,
                         solverTheta, A, theta, beta, grounded, floating,
                         h, s, zb, uObs):
-    """Save results to a firedrake dumbcheckpoint file
+    """
+    Save results to a firedrake dumbcheckpoint file
     """
     outFile = \
-        f'{inversionParams["inversionResult"]}.deg{inversionParams["degree"]}'
+        f'{inversionParams["inversionResult"]}.deg{inversionParams["degree"]}.h5'
     # Names used in checkpoint file - use dict for yaml dump
     varNames = {'uInv': 'uInv', 'betaInv': 'betaInv', 'AInv': 'AInv',
                 'groundedInv': 'groundedInv', 'floatingInv': 'floatingInv',
@@ -617,22 +627,24 @@ def saveInversionResult(inversionParams, modelResults, solverBeta,
     myVars = {'AInv': A, 'groundedInv': grounded, 'floatingInv': floating,
               'hInv': h, 'sInv': s, 'zbInv': zb, 'uObsInv': uObs}
     # Write results to check point file
-    with firedrake.DumbCheckpoint(outFile, mode=firedrake.FILE_CREATE) as chk:
+    with firedrake.CheckpointFile(outFile, 'w') as chk:
+        chk.save_mesh(mesh)
         # Beta solution
         if solverBeta is not None:  # Save inversion
-            chk.store(solverBeta.parameter, name=varNames['betaInv'])
+            chk.save_function(solverBeta.parameter, name=varNames['betaInv'])
         else:  # Save value used
-            chk.store(beta, name=varNames['betaInv'])
+            chk.save_function(beta, name=varNames['betaInv'])
         # Theta solution
         if solverTheta is not None:  # Save param and final state if solved
-            chk.store(solverTheta.parameter, name=varNames['thetaInv'])
-            chk.store(solverTheta.state, name=varNames['uInv'])
+            chk.save_function(solverTheta.parameter, name=varNames['thetaInv'])
+            chk.save_function(solverTheta.state, name=varNames['uInv'])
         else:  # Save theta used throughout model and final result
-            chk.store(theta, name=varNames['thetaInv'])
-            chk.store(solverBeta.state, name=varNames['uInv'])  # Save beta v
+            chk.save_function(theta, name=varNames['thetaInv'])
+            # Save beta v
+            chk.save_function(solverBeta.state, name=varNames['uInv'])
         # Save other variables
         for myVar in myVars:
-            chk.store(myVars[myVar], name=myVar)
+            chk.save_function(myVars[myVar], name=myVar)
     # Save end time
     modelResults['end_time'] = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
     # dump inputs and summary data to yaml file
@@ -700,6 +712,8 @@ def main():
     model = icepack.models.IceStream(friction=frictionLaw,
                                      viscosity=taperedViscosity)
     solver = icepack.solvers.FlowSolver(model, **opts)
+    print(opts)
+   
     # Initial solve
     u = solver.diagnostic_solve(velocity=uObs, thickness=h, surface=s,
                                 fluidity=A,
@@ -723,7 +737,7 @@ def main():
                                            beta, theta, model, opts,
                                            inversionParams, solverMethod, mesh)
     #
-    # step solvers to the actuall inversion
+    # step solvers to do the actuall inversion
     runSolvers(solverBeta, solverTheta, modelResults, uObs, mesh,
                rtol=inversionParams['rtol'],
                nSteps=inversionParams['maxSteps'],
@@ -731,8 +745,9 @@ def main():
                solveBeta=inversionParams['solveBeta'])
     #
     # Write results to a dumb check point file
-    saveInversionResult(inversionParams, modelResults, solverBeta, solverTheta,
-                        A, theta, beta, grounded, floating, h, s, zb, uObs)
+    saveInversionResult(mesh, inversionParams, modelResults, solverBeta,
+                        solverTheta, A, theta, beta, grounded, floating, h, s,
+                        zb, uObs)
     # Do a final forward solver to evaluate error
     thetaFinal = theta
     if inversionParams['solveViscosity']:
