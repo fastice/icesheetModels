@@ -15,6 +15,7 @@ from icepack.constants import weertman_sliding_law as m
 import matplotlib.pyplot as plt
 import icepack.plot
 import icepack.models
+import sys
 #from firedrake import PETSc
 import numpy as np
 import yaml
@@ -149,13 +150,17 @@ def parseInversionParams(parser, defaults):
         myerror(f'maxSteps ({args.maxSteps}) and rtol {args.rtol} must be > 0')
     if inversionParams['degree'] == 1 and inversionParams['initWithDeg1']:
         myerror('degree=1 not compatible with initWithDeg1')
+    #
+    if inversionParams['initWithDeg1']:
+        inversionParams['initFile'] = \
+            f'{inversionParams["inversionResult"]}.deg1'
     return inversionParams
 
 
 # ----- Initialization routines -----
 
 
-def betaInit(s, h, speed, V, Q, Q1, grounded, inversionParams):
+def betaInit(s, h, speed, V, Q, grounded, inversionParams):
     """Compute intitial beta using 0.5 taud.
     Parameters
     ----------
@@ -173,14 +178,13 @@ def betaInit(s, h, speed, V, Q, Q1, grounded, inversionParams):
         Mask with 1s for grounded 0 for floating.
     """
     # Use a result from prior inversion
-    checkFile = inversionParams['initFile']
-    Quse = Q
-    if inversionParams['initWithDeg1']:
-        checkFile = f'{inversionParams["inversionResult"]}.deg1'
-        Quse = Q1
-    if checkFile is not None:
-        betaTemp = mf.getCheckPointVars(checkFile, 'betaInv', Quse)['betaInv']
+    if inversionParams['initFile'] is not None:
+        # This will break on the older files
+        print(inversionParams['initFile'], 'beta')
+        betaTemp = mf.getCheckPointVars(inversionParams['initFile'],
+                                        'betaInv', Q)['betaInv']
         beta1 = icepack.interpolate(betaTemp, Q)
+        Print(f'Initialized beta with {inversionParams["initFile"]}')
         return beta1
     # No prior result, so use fraction of taud
     tauD = firedrake.project(-rhoI * g * h * grad(s), V)
@@ -198,7 +202,7 @@ def betaInit(s, h, speed, V, Q, Q1, grounded, inversionParams):
     return beta
 
 
-def thetaInit(Ainit, Q, Q1, grounded, floating, inversionParams):
+def thetaInit(Ainit, Q, grounded, floating, inversionParams):
     """Compute intitial theta on the ice shelf (not grounded).
     Parameters
     ----------
@@ -217,18 +221,12 @@ def thetaInit(Ainit, Q, Q1, grounded, floating, inversionParams):
     theta : firedrake function
         theta for floating ice
     """
-    # Get initial file if there is one to init inversion
-    checkFile = inversionParams['initFile']
-    Quse = Q
-    # Use degree 1 solution if prompted
-    if inversionParams['initWithDeg1']:
-        checkFile = f'{inversionParams["inversionResult"]}.deg1'
-        Quse = Q1
     # Now check if there is a file specificed, and if so, init with that
-    if checkFile is not None:
-        Print(f'Init. with theta: {checkFile}')
-        thetaTemp = mf.getCheckPointVars(checkFile,
-                                         'thetaInv', Quse)['thetaInv']
+    if inversionParams['initFile'] is not None:
+        Print(f'Init. with theta: {inversionParams["initFile"]}')
+        # This will break on the older files
+        thetaTemp = mf.getCheckPointVars(inversionParams['initFile'],
+                                         'thetaInv', Q)['thetaInv']
         thetaInit = icepack.interpolate(thetaTemp, Q)
         return thetaInit
     # No initial theta, so use initial A to init inversion
@@ -672,15 +670,20 @@ def main():
     solverMethod = getSolverMethod(inversionParams['solverMethod'])
     #
     # Read mesh and setup function spaces
+    if inversionParams['initFile'] is not None:
+        meshI = mf.getMeshFromCheckPoint(inversionParams['initFile'])
+    else:
+        meshI = None
     mesh, Q, V, meshOpts = \
         mf.setupMesh(inversionParams['mesh'],
                      degree=inversionParams['degree'],
-                     meshOversample=inversionParams['meshOversample'])
+                     meshOversample=inversionParams['meshOversample'],
+                     newMesh=meshI)
     Print(f'Mesh Elements={mesh.num_cells()} Vertices={mesh.num_vertices()}')
     # Set up deg 1 function space if using deg 1 to init solution
-    Q1 = None
-    if inversionParams['initWithDeg1']:
-        Q1 = firedrake.FunctionSpace(mesh, family='CG', degree=1)
+    #Q1 = None
+    #if inversionParams['initWithDeg1']:
+    #    Q1 = firedrake.FunctionSpace(mesh, family='CG', degree=1)
     area = firedrake.assemble(firedrake.Constant(1) * firedrake.dx(mesh))
     opts = {'dirichlet_ids': meshOpts['dirichlet_ids']}  # Opts from mesh
     #
@@ -701,8 +704,8 @@ def main():
     #
     # Initialize beta and theta
     Print(f'run time {datetime.now()-startTime}')
-    beta = betaInit(s, h, speed, V, Q, Q1, grounded, inversionParams)
-    theta = thetaInit(A, Q, Q1, grounded, floating, inversionParams)
+    beta = betaInit(s, h, speed, V, Q, grounded, inversionParams)
+    theta = thetaInit(A, Q, grounded, floating, inversionParams)
     # Print min/max for quick QA of inputs
     printExtremes(h=h, s=s, A=A, beta=beta, theta=theta)
     # Assign uThresh here to force correct type for parameter
@@ -713,7 +716,7 @@ def main():
                                      viscosity=taperedViscosity)
     solver = icepack.solvers.FlowSolver(model, **opts)
     print(opts)
-   
+
     # Initial solve
     u = solver.diagnostic_solve(velocity=uObs, thickness=h, surface=s,
                                 fluidity=A,
@@ -743,6 +746,7 @@ def main():
                nSteps=inversionParams['maxSteps'],
                solveViscosity=inversionParams['solveViscosity'],
                solveBeta=inversionParams['solveBeta'])
+    sys.stdout.flush()
     #
     # Write results to a dumb check point file
     saveInversionResult(mesh, inversionParams, modelResults, solverBeta,
