@@ -18,6 +18,7 @@ import yaml
 import os
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
+import shutil
 
 rhoW = rhoI * 1028./917.  # This ensures rhoW based on 1028
 waterToIce = 1000./917.
@@ -518,6 +519,30 @@ def updateSummaryData(summaries, h, s, u, a, melt, SMB, grounded, floating,
 #         mp = yaml.load(fp, Loader=yaml.FullLoader)
 #     return mp['summaryFile']
 
+def restoreOriginal(checkFile):
+    '''
+    If the original checkFile was linking to a file in /var/tmp, move it back
+
+    '''
+    # Check if the given file is a symbolic link
+    if os.path.islink(checkFile):
+        # Get the target file the symlink points to
+        target = os.readlink(checkFile)
+        # Ensure the target file exists
+        if os.path.exists(target):
+            # Remove the symbolic link
+            os.remove(checkFile)
+            # Move the original file to the location of the symlink
+            shutil.move(target, checkFile)
+            print(f"Restored {target} to {checkFile}")
+        else:
+            # If the target file doesn't exist, print an error message
+            print(f"Error: Target {target} does not exist")
+    else:
+        # If the checkFile is not a symlink, print that it's not a symlink
+        print(f"{checkFile} is not a symlink")
+        
+        
 def reinitSummary(forwardParams, region='All'):
     ''' Init with last temporary summary file '''
     if region == 'All':
@@ -781,9 +806,11 @@ def setupOutputs(forwardParams, inversionParams, meltParams, check=True):
     if check:
         if forwardParams['restart']:
             mode = 'a'
+            restoreOriginal(f'{chkFile}.h5')
         else:
             mode = 'w'
-        return firedrake.CheckpointFile(f'{chkFile}.h5', mode), chkFile
+        print(f'mode = {mode}')
+        return mf.CheckpointFileNFS(f'{chkFile}.h5', mode), chkFile
     return None, None
 
 
@@ -853,7 +880,7 @@ def getMeshFromCheckPoint(checkFile):
         checkFile = f'{checkFile}.h5'
     print(checkFile)
 
-    with firedrake.CheckpointFile(checkFile, 'r') as chk:
+    with mf.CheckpointFileNFS(checkFile, 'r') as chk:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', category=DeprecationWarning)
             try:
@@ -1017,6 +1044,7 @@ def main():
     beta = beta0
     print('Loop')
     if startYear > forwardParams['nYears']:
+        chk.close()
         myerror(f'startYear ({startYear}) is greater than nYears '
                 f'({forwardParams["nYears"]}). Restart '
                 f'{forwardParams["nYears"]} so sim may be done')
@@ -1064,7 +1092,10 @@ def main():
                              floating, t, Q, mesh, deltaT, beginTime,
                              regionMasks):
             if plotData['plotResult']:  # Only do final plot (below)
-                mapPlots(plotData, t, melt, betaScale, h, hLast, deltaT, Q)
+                try:
+                    mapPlots(plotData, t, melt, betaScale, h, hLast, deltaT, Q)
+                except Exception:
+                    print('Fix triconturf')
             # For now ouput fields at same interval as summary data
             outputTimeStep(int(np.round(t)), mesh, chk,  h=h, s=s, u=u,
                            grounded=grounded, floating=floating)
@@ -1073,6 +1104,8 @@ def main():
         #
 
         # profilePlots(t, plotData, u, s, h, zb, zF, melt, Q)
+    # Close chk file
+    chk.close()
     #
     # End Simulation so save results
     timeSeriesPlots(t, plotData, summaryData)
