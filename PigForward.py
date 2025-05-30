@@ -31,12 +31,15 @@ floatingG, groundedG, mesh = None, None, None
 # on ice streams other than PIG.
 GLThreshDefaults = {'schoof': 41, 'weertman': 122}
 
+
 # ----- Parse command and input file arguments -----
 
 
 def parsePigForwardArgs():
     ''' Handle command line args'''
     defaults = {'geometry': 'PigGeometry.yaml',
+                'scaleConstants': None,
+                'scaleConstantsFile': None,
                 'degree': 1,
                 'plotResult': False,
                 'noOverwrite': False,
@@ -70,6 +73,9 @@ def parsePigForwardArgs():
     parser.add_argument('--geometry', type=str, default=None,
                         help=f'Yaml file with geometry file info '
                         f'[{defaults["geometry"]}] ')
+    parser.add_argument('--scaleConstantsFile', type=str,
+                        default=None,
+                        help='scale constants for basal shear stress')
     parser.add_argument('--SMB', type=str, default=None,
                         help=f'Geotiff with SMB data '
                         f'[{defaults["SMB"]}] ')
@@ -180,7 +186,7 @@ def parseForwardParams(parser, defaults):
     inversionParams = mf.readModelParams(inversionYaml, key='inversionParams')
     #
     # Grap inversion params for forward sim
-    for key in ['friction', 'degree', 'mesh', 'uThresh', 'GLTaper', 
+    for key in ['friction', 'degree', 'mesh', 'uThresh', 'GLTaper',
                 'solverTolerance']:
         try:
             forwardParams[key] = inversionParams[key]
@@ -199,6 +205,11 @@ def parseForwardParams(parser, defaults):
         mywarning(f'Cannot reinit with tmp summary {summaryFile}\n'
                   'Starting from scratch')
         forwardParams['restart'] = False
+    #
+    if forwardParams['scaleConstantsFile'] is not None:
+        with open(forwardParams['scaleConstantsFile'], 'r') as fp:
+            forwardParams['scaleConstants'] = yaml.load(fp,
+                                                        Loader=yaml.FullLoader)
     #
     return forwardParams, inversionParams
 
@@ -244,16 +255,12 @@ def mapPlots(plotData, t, melt, floating, h, hLast, deltaT, Q):
     '''
     setupMapPlots(plotData)
     axes = plotData['axesM'].flatten()
-    meltC = icepack.plot.tricontourf(icepack.interpolate(melt, Q),
-                                     levels=np.linspace(-150, 0, 151),
-                                     extend='both', axes=axes[0])
-    floatC = icepack.plot.tricontourf(floating, axes=axes[1], extend='both',
-                                      levels=np.linspace(0, 1, 106))
-
+    meltC = firedrake.tripcolor(icepack.interpolate(melt, Q),
+                                vmin=-150, vmax=150, axes=axes[0])
+    floatC = firedrake.tripcolor(floating, axes=axes[1], vmin=0, vmax=1)
     thin = icepack.interpolate((h - hLast) / deltaT, Q)
-    thinC = icepack.plot.tricontourf(thin, levels=np.linspace(-8, 8, 161),
-                                     axes=axes[2], extend='both',
-                                     cmap=plt.get_cmap('bwr_r'))
+    thinC = firedrake.tripcolor(thin, vmin=-8, vmax=8, axes=axes[2],
+                                cmap=plt.get_cmap('bwr_r'))
     plotData['figM'].suptitle(f'Simulation Year: {t:0.1f}')
     if plotData['figMColorbar']:
         titles = ['melt (m/yr)', 'floating', 'dH/dt (m/yr)']
@@ -358,7 +365,7 @@ def profilePlots(t, plotData, u, s, h, zb, zF, melt, Q, first=False):
         zFProf = [zF((xy[0], xy[1])) for xy in plotData['profXY']]
         plotData['axesP'][1].plot(plotData['distance'], zFProf, color='b')
     # Now do plots
-    speed = firedrake.interpolate(firedrake.sqrt(firedrake.inner(u, u)), Q)
+    speed = icepack.interpolate(firedrake.sqrt(firedrake.inner(u, u)), Q)
     speedProf = [speed((xy[0], xy[1])) for xy in plotData['profXY']]
     plotData['axesP'][0].plot(plotData['distance'], speedProf,
                               label=myLabel, color=myColor)
@@ -387,7 +394,7 @@ def profilePlots(t, plotData, u, s, h, zb, zF, melt, Q, first=False):
         plotData['figP'].canvas.draw()
 
 
-def myColorBar(fig, ax, contours, label=''):
+def myColorBar(fig, ax, contours, label='', extend='both'):
     divider = make_axes_locatable(ax)
     cax = divider.append_axes('right', size='5%', pad=0.05)
     fig.colorbar(contours, cax=cax, label=label)
@@ -503,6 +510,48 @@ def updateSummaryData(summaries, h, s, u, a, melt, SMB, grounded, floating,
                                           printStatus=printStatus)
     return returnStatus
 
+
+def scaleBetaGeo(t, speed, forwardParams, regionMasks):
+    '''
+    Compute scaling for beta0 for experiments to speedup or slowdown.
+
+    Parameters
+    ----------
+    t : float
+        DESCRIPTION.
+    speed : firedrake function
+        speed.
+    forwardParams : dict
+        forwward parameter dict.
+    regionMasks : dict
+        DESCRIPTION.
+    Returns
+    -------
+    firedrake function
+        scale factor for beta.
+
+    '''
+    scaleConstants = forwardParams['scaleConstants']
+    # no scaling
+    if scaleConstants is None:
+        return firedrake.Constant(1)
+    # not in range for scaling
+    betaScale = firedrake.Function(speed.function_space())
+    betaScale.assign(1.0)
+    # Loop over rgions
+    for region in scaleConstants:
+        # scale if in mask and time range
+        t1 = scaleConstants[region]['firstYear']
+        t2 = scaleConstants[region]['lastYear']
+        if t >= t1 and t <= t2:
+            i = np.logical_and(
+                    np.logical_and(
+                        speed.dat.data > scaleConstants[region]['vmin'],
+                        speed.dat.data < scaleConstants[region]['vmax']),
+                    regionMasks[region].dat.data > 0)
+            betaScale.dat.data[i] = scaleConstants[region]['scale']
+    return betaScale
+
 #
 # ---- Restart Code ----
 
@@ -541,8 +590,8 @@ def restoreOriginal(checkFile):
     else:
         # If the checkFile is not a symlink, print that it's not a symlink
         print(f"{checkFile} is not a symlink")
-        
-        
+
+
 def reinitSummary(forwardParams, region='All'):
     ''' Init with last temporary summary file '''
     if region == 'All':
@@ -982,6 +1031,8 @@ def main():
         beta0, theta0, A0, s0, h0, zb, floating0, grounded0, uInv, uObs = \
             mf.getInversionData(forwardParams['inversionResult'], Q, V,
                                 mesh=mesh)
+        speedObs = icepack.interpolate(
+            firedrake.sqrt(firedrake.inner(uObs, uObs)), Q)
         # Compute masks for combining A0 with theta0
         groundedSmooth, floatingSmooth = \
             setupTaperedMasks(inversionParams, grounded0, floating0)
@@ -1049,6 +1100,9 @@ def main():
                 f'({forwardParams["nYears"]}). Restart '
                 f'{forwardParams["nYears"]} so sim may be done')
     times = np.arange(startYear, forwardParams['nYears'] + deltaT, deltaT)
+    # compute the intial beta scale
+    print(forwardParams['scaleConstants'])
+    betaScaleGeo = scaleBetaGeo(times[0], speedObs, forwardParams, regionMasks)
     for t in np.around(times, decimals=6):
         #
         hLast = h.copy(deepcopy=True)  # Save for next summary calc
@@ -1070,12 +1124,12 @@ def main():
         s = computeSurface(h, zb, Q)
         floating, grounded = mf.flotationMask(s, zF, Q)
         # Scale beta near gl
-        if t > forwardParams['tBetaScale']:
+        if t > forwardParams['tBetaScale']:    
             betaScale = mf.reduceNearGLBeta(s, s0, zF, grounded, Q,
                                             forwardParams['GLThresh'])
-            beta = icepack.interpolate(beta0 * betaScale, Q)
+            beta = icepack.interpolate(beta0 * betaScale * betaScaleGeo, Q)
         else:
-            beta = beta0
+            beta = icepack.interpolate(beta0 * betaScaleGeo, Q)
         uThresh = firedrake.Constant(forwardParams['uThresh'])
         u = forwardSolver.diagnostic_solve(velocity=u, thickness=h, surface=s,
                                            fluidity=A0, beta=beta,
@@ -1091,6 +1145,10 @@ def main():
         if updateSummaryData(summaryData, h, s, u, a, melt, SMB, grounded,
                              floating, t, Q, mesh, deltaT, beginTime,
                              regionMasks):
+            # update beta scale
+            betaScaleGeo = scaleBetaGeo(t, speedObs, forwardParams,
+                                        regionMasks)
+            #
             if plotData['plotResult']:  # Only do final plot (below)
                 try:
                     mapPlots(plotData, t, melt, betaScale, h, hLast, deltaT, Q)

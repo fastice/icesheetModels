@@ -1,31 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import argparse
-from icepack.statistics import  StatisticsProblem, MaximumProbabilityEstimator
-
-from modelfunc import myerror
+from icepack.statistics import StatisticsProblem, MaximumProbabilityEstimator
+from modelfunc import myerror, printExtremes, taperedViscosityIS
 import modelfunc as mf
 import firedrake
 import icepack
-from icepack.constants import ice_density as rhoI
-from firedrake import max_value
 from datetime import datetime
-#import icepack.inverse
 from firedrake import grad
-from icepack.constants import gravity as g
-from icepack.constants import weertman_sliding_law as m
-import matplotlib.pyplot as plt
 import icepack.plot
 import icepack.models
-import numpy as np
 import yaml
 from firedrake import PETSc
 options = PETSc.Options()
 options['options_left'] = False
 
-Print = print #PETSc.Sys.Print
 
-RS = None
+Print = print  # PETSc.Sys.Print
+
 # ---- Parse Command Line ----
 
 
@@ -40,12 +32,11 @@ def setupInversionArgs():
                 'rateFactorA': None,
                 'degree': 2,
                 'friction': 'weertman',
-                'maxSteps': 30,
+                'maxSteps': 50,
                 'rtol': 0.5e-3,
                 'GLTaper': 4000,
                 'solveViscosity': False,
                 'solveBeta': True,
-                'solverMethod': 'GaussNewton',
                 'initWithDeg1': False,
                 'initFile': None,
                 'plotResult': False,
@@ -78,14 +69,14 @@ def setupInversionArgs():
     parser.add_argument('--friction', type=str, default=None,
                         choices=["weertman", "schoof"],
                         help=f'Friction law [{defaults["friction"]}]')
-    parser.add_argument('--solverMethod', type=str, default=None,
-                        choices=["GaussNewton", "BFGS"],
-                        help=f'Friction law [{defaults["friction"]}]')
+    # parser.add_argument('--solverMethod', type=str, default=None,
+    #                     choices=["GaussNewton", "BFGS"],
+    #                     help=f'Friction law [{defaults["friction"]}]')
     parser.add_argument('--solverTolerance', type=float, default=1e-6,
                         help='Tolerance for solver')
     parser.add_argument('--maxSteps', type=int, default=None,
                         help='Max steps for inversion '
-                        f'[{defaults["maxSteps"]}]')  
+                        f'[{defaults["maxSteps"]}]')
     parser.add_argument('--meshOversample', type=int, default=None,
                         help=f'Mesh oversample factor '
                         f'[{defaults["meshOversample"]}]')
@@ -166,60 +157,16 @@ def parseInversionParams(parser, defaults):
             and inversionParams['rateFactorB'] is None:
         myerror('Rate factor not specified')
     if inversionParams['rateFactorA'] is not None \
-          and inversionParams['rateFactorB'] is not None:
+            and inversionParams['rateFactorB'] is not None:
         myerror('Rate factors specfied twice: \n'
                 f'A={inversionParams["rateFactorA"]}\n'
                 f'B={inversionParams["rateFactorB"]}')
-    return inversionParams
 
-
-# ----- Initialization routines -----
-
-
-def betaInit(s, h, speed, V, Q, grounded, inversionParams):
-    """Compute intitial beta using 0.5 taud.
-    Parameters
-    ----------
-    s : firedrake function
-        model surface elevation
-    h : firedrake function
-        model thickness
-    speed : firedrake function
-        modelled speed
-    V : firedrake vector function space
-        vector function space
-    Q : firedrake function space
-        scalar function space
-    grounded : firedrake function
-        Mask with 1s for grounded 0 for floating.
-    """
-    # Use a result from prior inversion
-    if inversionParams['initFile'] is not None:
-        # This will break on the older files
-        print(inversionParams['initFile'], 'beta')
-        betaTemp = mf.getCheckPointVars(inversionParams['initFile'],
-                                        'betaInv', Q)['betaInv']
-        beta1 = icepack.interpolate(betaTemp, Q)
-        Print(f'Initialized beta with {inversionParams["initFile"]}')
-        return beta1
-    # No prior result, so use fraction of taud
-    tauD = firedrake.project(-rhoI * g * h * grad(s), V)
+    if inversionParams['regBeta'] <= 0 or inversionParams['regTheta'] <= 0:
+        myerror(f"regBeta {inversionParams['regBeta']} and "
+                f"regTheta {inversionParams['regTheta']} must be > 0")
     #
-    stress = firedrake.sqrt(firedrake.inner(tauD, tauD))
-    Print('stress', firedrake.assemble(stress * firedrake.dx))
-    print("Speed min, max:", speed.dat.data_ro.min(), speed.dat.data_ro.max())
-    fraction = Constant(0.95)
-    U = max_value(speed, 1)
-    #print('U min, max', firedrake.assemble(U), type(U))
-    C = fraction * stress / U**(1/m)
-    if inversionParams['friction'] == 'schoof':
-        mExp = 1/m + 1
-        U0 = Constant(inversionParams['uThresh'])
-        C = C * (m/(m+1)) * (U0**mExp + U**mExp)**(1/(m+1))
-    print('C = ',C, type(C))
-    beta = firedrake.Function(Q)
-    beta.interpolate(firedrake.sqrt(C) * grounded)
-    return beta
+    return inversionParams
 
 
 def thetaInit(Ainit, Q, grounded, floating, inversionParams):
@@ -247,13 +194,15 @@ def thetaInit(Ainit, Q, grounded, floating, inversionParams):
         # This will break on the older files
         thetaTemp = mf.getCheckPointVars(inversionParams['initFile'],
                                          'thetaInv', Q)['thetaInv']
-        thetaInit = icepack.interpolate(thetaTemp, Q)
+        thetaInit = firedrake.Function(Q)
+        thetaInit.interpolate(thetaTemp)
         return thetaInit
     # No initial theta, so use initial A to init inversion
     Atheta = mf.firedrakeSmooth(Ainit, alpha=1000)
     theta = firedrake.Function(Q)
     theta.interpolate(firedrake.ln(Atheta))
     return theta
+
 
 def defineSimulation(solver, **kwargs):
     '''
@@ -279,56 +228,95 @@ def defineSimulation(solver, **kwargs):
             return solver.diagnostic_solve(beta=beta, theta=theta, **kwargs)
     return runSimulation
 
-def optimizationProblem(simulation, lossFunctional, regularization, controls):
+
+def setupModel(frictionLaw, viscosity, **opts):
     '''
-     Define the optization problem given
+    Setup icestream forward model
+
     Parameters
     ----------
-    simulation : 
-        Ice stream solution.
-    lossFunctional : 
-        loss function.
-    regularization:
-        regularization function
-    controls : 
-        controls to be solved for single as scalar, double as list.
+    frictionLaw : function
+        Friction law function.
+    viscosity : function
+        Viscosity function.
+    **opts : dict/keywords
+        Data for the forward solution.
 
     Returns
     -------
-    StatisticsProblem
+    solver : Function
+        Forward solver.
 
     '''
-    return StatisticsProblem(simulation=simulation,
-                             loss_functional=lossFunctional,
-                             regularization=regularization,
-                             controls=controls)
+    model = icepack.models.IceStream(friction=frictionLaw,
+                                     viscosity=viscosity)
+    return icepack.solvers.FlowSolver(model, **opts)
+
 
 def setupInversion(solver, beta, theta, h, s, A, uObs, grounded,
-                 floating, groundedSmooth, floatingSmooth, sigmaX, sigmaY,
-                  opts, inversionParams):
-    ''' Set up the solvers '''
-    uThresh = Constant(inversionParams['uThresh'])
+                   floating, groundedSmooth, floatingSmooth, sigmaX, sigmaY,
+                   opts, inversionParams, meshArea):
+    '''
+    Sets up the functions needed to perform the inversion
+
+    Parameters
+    ----------
+    solver : TYPE
+        The forward solver function.
+    beta : TYPE
+        The basal shear stress parameter.
+    theta : TYPE
+        The viscosity parameter for the ice shelf.
+    h : TYPE
+        Thickness.
+    s : TYPE
+        Surface topography.
+    A : TYPE
+        The flow law parameter for grounded areas.
+    uObs : firedrake
+        Observed velocity..
+    grounded : TYPE
+        Grounded area mask.
+    floating : TYPE
+        Floating area mask.
+    groundedSmooth : TYPE
+        Tapered grounded mask to blend viscosity at grounding line.
+    floatingSmooth : TYPE
+        Tapered floating mask to blend viscosity at grounding line.
+    sigmaX : firedrake
+        X component of velocity error.
+    sigmaY : firedrake
+        X component of velocity error...
+    opts : TYPE
+        DESCRIPTION.
+    inversionParams : TYPE
+        DESCRIPTION.
+    meshArea : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    function
+        Solver to do the inversion.
+    '''
     #
-    # Set up problem for theta
-    
+    # Make the objective function
     if inversionParams['solveBeta'] and not inversionParams['solveViscosity']:
-        lossFunctional = makeObjectiveFunction(uObs, sigmaX, sigmaY,
+        lossFunctional = makeObjectiveFunction(uObs, sigmaX, sigmaY, meshArea,
                                                mask=grounded)
-        print(type(beta))
         controls = beta
     else:
-        lossFunctional = makeObjectiveFunction(uObs, sigmaX, sigmaY, mask=None)
-        print(type(beta))
-        print(type(theta))
-        printExtremes(beta=beta, theta=theta)
-        #Smyerror("stop setup")
+        lossFunctional = makeObjectiveFunction(uObs, sigmaX, sigmaY, meshArea,
+                                               mask=None)
         controls = [beta, theta]
     #
+    # Make the regularization function
     regularization = makeRegularization(inversionParams['regBeta'],
                                         inversionParams['regTheta'],
-                                        grounded, 
-                                        floating)  
-    
+                                        grounded,
+                                        floating,
+                                        meshArea)
+    # Stuff the model params in a dict to pass to model
     simKeywords = {'velocity': uObs,
                    'thickness': h,
                    'surface': s,
@@ -338,153 +326,190 @@ def setupInversion(solver, beta, theta, h, s, A, uObs, grounded,
                    'groundedSmooth': groundedSmooth,
                    'floatingSmooth': floatingSmooth
                    }
+    #
+    # Note solving for velocity so use the default
     if not inversionParams['solveViscosity']:
         simKeywords['theta'] = theta
-    #     simKeywords['groundedSmooth'] = groundedSmooth
-    #     simKeywords['floatingSmooth'] = floatingSmooth
-                                 
+    # Create the simulation
     simulation = defineSimulation(solver, **simKeywords)
+    # Run the simulation as test and check the outputs
     u = simulation(controls)
-    printExtremes(u=u, uObs=uObs, grounded=grounded, sigmaX=sigmaX, sigmaY=sigmaY)
-    print('loss', firedrake.assemble(lossFunctional(u)))
-    print('beta', firedrake.assemble(regularization([beta, theta])))
-    print(controls)
-    #print('theta', firedrake.assemble(regularization(theta)))
-    printExtremes(theta=theta)
-    
-    #myerror('stp')
-
+    Print('Sover setup solution')
+    printExtremes(u=u)
+    # Setup the statistics problem
     myProblem = StatisticsProblem(simulation=simulation,
                                   loss_functional=lossFunctional,
                                   regularization=regularization,
                                   controls=controls)
-    #
-    return MaximumProbabilityEstimator(myProblem,
-                                       gradient_tolerance=1e-4,
-                                       step_tolerance=1e-1,
-                                       max_iterations=50)
-    return 
-   
-def Constant(value):
-    constant = firedrake.Function(RS)
-    constant.assign(value)
-    return constant
+    # Return the inversion solver
+    return \
+        MaximumProbabilityEstimator(myProblem,
+                                    gradient_tolerance=1e-6,
+                                    step_tolerance=1e-1,
+                                    max_iterations=inversionParams['maxSteps'])
+
 
 # ----- Objective/Regularization Functions
 
 
+def makeObjectiveFunction(uObs, sigmaX, sigmaY, area, mask=None):
+    '''
+    Create objective function for simulation with observed velocity and errors.
 
-def makeObjectiveFunction(uObs, sigmaX, sigmaY, mask=None):
-    ''' Allows passing additional variables to objectiveFunction'''
+    Parameters
+    ----------
+    uObs : firedrake
+        Observed velocity.
+    sigmaX : firedrake
+        X component of velocity error.
+    sigmaY : firedrake
+        X component of velocity error..
+    area : firedrake constant
+        DESCRIPTION.
+    mask : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    function
+        Customized objective function.
+    '''
     def objectiveFunction(u):
-        """Objective function for model runs for inverse theta solved only on
-        floating ice regions.
+        '''
         Parameters
-        ---------
-        see objectiveFunction
-        """
-        print('start o')
+        ----------
+        u : firedrake
+            Modeled velocity.
+
+        Returns
+        -------
+        firedrake
+            Objective function.
+
+        '''
         deltau = u - uObs
         if mask is not None:
-            print('end o mask')
-            return mask * 0.5 * ((deltau[0] / sigmaX)**2 + 
-                                 (deltau[1] / sigmaY)**2) * firedrake.dx
+            return 0.5 * mask/area * ((deltau[0] / sigmaX)**2 +
+                                      (deltau[1] / sigmaY)**2) * firedrake.dx
         else:
-            print('end o no mask')
-            return  0.5 * ((deltau[0] / sigmaX)**2 +\
-                           (deltau[1] / sigmaY)**2) * firedrake.dx
+            return 0.5 / area * ((deltau[0] / sigmaX)**2 +
+                                 (deltau[1] / sigmaY)**2) * firedrake.dx
     return objectiveFunction
 
-def makeRegularization(regBeta, regTheta, grounded, floating):
-    ''' Allows passing additional variables to rebularizationBeta '''
+
+def makeRegularization(regBeta, regTheta, grounded, floating, meshArea):
+    '''
+    Creates a regularization function for single or joint inversion
+    Parameters
+    ----------
+    regBeta : float
+        regularization constant for beta.
+    regTheta : float
+        regularization constant for theta.
+    grounded : firedrake function
+        Mask for grounded area.
+    floating : firedrake function
+        Mask for floating area.
+    meshArea : firedrake constant
+        Mesh area use to normalize result.
+    Returns
+    -------
+    regularization
+        Customized regularization function.
+    '''
     def regularization(controls):
         """Regularization function for beta in friction inversion
         Parameters
         ----------
-        beta : firedrake function
-            Beta for friction model with C=beta^2
+        controls : firedrake function or list of functions
+            Beta for friction model for [Beta, Theta] for joint
         Returns
         -------
         R: Firedrake function
             Regularization with dx
         """
-        print('start reg', type(controls), regBeta, regTheta)
         if type(controls) is not list:
             beta = controls
             theta = None
         else:
             beta, theta = controls
-        # beta
-        PhiBeta = Constant(3.)
-        LBeta = Constant(np.sqrt(1000.) * 19.5e3)
-        RBeta = regBeta * 0.5 * grounded * (LBeta / PhiBeta)**2 * \
-            firedrake.inner(grad(beta), grad(beta)) 
+        # scaling constants
+        a = firedrake.Constant(10e6)
+        b = firedrake.Constant(10e6)
+        # get mesh
+        mesh = grounded.function_space().mesh()
+        RBeta = 0.5 * regBeta * grounded * a * firedrake.inner(grad(beta),
+                                                               grad(beta))
+        # Return if beta only
         if theta is None:
-            print('end reg no theta')
-            return RBeta * firedrake.dx
-        # theta 
-        PhiTheta = Constant(3.)
-        LTheta = Constant(4 * 19.5e3)
-        # floating mask will not stop steep gradient at gl
-        RTheta = regTheta * 0.5 * (LTheta / PhiTheta)**2 * \
-            floating * firedrake.inner(grad(theta), grad(theta))
-        #
-        print('end reg ')
-        return (RBeta + RTheta) * firedrake.dx
+            return RBeta/meshArea * firedrake.dx(mesh)
+        # theta if needed
+        RTheta = 0.5 * regTheta * floating * b * firedrake.inner(grad(theta),
+                                                                 grad(theta))
+        # Return dual value
+        return (RBeta + RTheta)/meshArea * firedrake.dx(mesh)
     return regularization
 
 
 
-# ----- Viscosity and Friction ------
+# def getFrictionLaw(s, h, uObs, Q, V,  inversionParams):
+#     """Compute intitial beta using 0.95 taud.
+#     Parameters
+#     ----------
+#     s : firedrake function
+#         model surface elevation
+#     h : firedrake function
+#         model thickness
+#     speed : firedrake function
+#         modelled speed
+#     V : firedrake vector function space
+#         vector function space
+#     Q : firedrake function space
+#         scalar function space
+#     grounded : firedrake function
+#         Mask with 1s for grounded 0 for floating.
+#     """
+#     m = 3
+#     speedObs = icepack.interpolate(firedrake.sqrt(firedrake.inner(uObs,
+#                                                                   uObs)), Q)
+#     tauD = firedrake.project(-rhoI * g * h * grad(s), V)
+#     #
+#     stress = firedrake.sqrt(firedrake.inner(tauD, tauD))
+#     Print('stress', firedrake.assemble(stress * firedrake.dx))
+#     print("Speed min, max:", speedObs.dat.data_ro.min(),
+#           speedObs.dat.data_ro.max())
+#     fraction = firedrake.Constant(0.95)
+#     U = max_value(speedObs, 1)
+#     # Schoofie
+#     if inversionParams['friction'] == 'schoof':
+#         mExp = 1/m + 1
+#         U0 = firedrake.Constant(inversionParams['uThresh'])
+#         expr = fraction * stress * \
+#             ((U0**mExp + U**mExp)**(1./(m+1))) * U**(-1./m)
+#         C_0 = firedrake.Function(Q).interpolate(expr)
 
+#         # Create RCF log friction
+#         def logFriction(**kwargs):
+#             u, beta, grounded = map(kwargs.get,
+#                                     ("velocity", "beta", "grounded"))
+#             uMag = firedrake.sqrt(firedrake.inner(u, u))
+#             return grounded * C_0 * firedrake.exp(beta) * \
+#                 ((U0**mExp + uMag**mExp)**(m/(m + 1.)) - U0)
+#     # Weertman
+#     elif inversionParams['friction'] == 'weertman':
+#         expr = fraction * stress / U ** (1 / m)
+#         C_0 = firedrake.Function(Q).interpolate(expr)
 
-def nonTaperedViscosity(velocity, thickness, fluidity):
-    ''' This is a test version to use feathered grouning to floating transition
-    '''
-    # Combine tapered A on grouned and theta for smooth
-    return \
-        icepack.models.viscosity.viscosity_depth_averaged(velocity=velocity,
-                                                          thickness=thickness,
-                                                          fluidity=fluidity)
-
-
-
-def taperedViscosity(velocity, thickness, fluidity, theta,
-                     groundedSmooth, floatingSmooth):
-    ''' This is a test version to use feathered grouning to floating transition
-    '''
-    # Combine tapered A on grouned and theta for smooth
-    print('vis   fix.....')
-    # A = groundedSmooth * fluidity + floatingSmooth * firedrake.exp(theta)
-    A = firedrake.exp(theta)
-    viscosity = \
-        icepack.models.viscosity.viscosity_depth_averaged(velocity=velocity,
-                                                          thickness=thickness,
-                                                          fluidity=A)
-    return viscosity
-
-
-def getFrictionLaw(inversionParams):
-    ''' Lookup the friction model by model name (weertman or schoof) '''
-    # Available models; augment as needed.
-    
-    print(type(RS))
-    uThresh = Constant(inversionParams['uThresh'])
-    def frictionLaw(velocity, grounded, beta):
-        if inversionParams['friction'] == 'weertman':
-            return mf.weertmanFriction(velocity, grounded, beta, uThresh)
-        elif inversionParams['friction'] == 'schoof':
-            return mf.schoofFriction(velocity, grounded, beta, uThresh)
-        myerror("Invalid friction type {inversionParams['friction']}")
-    return frictionLaw
-
-
-def getSolverMethod(solverMethodName):
-    ''' Lookup solver method by name (GaussNewton, BFGS) '''
-    # available methods; add new methods as needed.
-    solverMethods = {'GaussNewton': icepack.inverse.GaussNewtonSolver,
-                     'BFGS': icepack.inverse.BFGSSolver}
-    return solverMethods[solverMethodName]
+#         # create Weertman version of logFriction
+#         def logFriction(**kwargs):
+#             u, beta, grounded = map(kwargs.get,
+#                                     ("velocity", "beta", "grounded"))
+#             u_0 = firedrake.Constant(1)
+#             return grounded * m / (m + 1) * C_0 * firedrake.exp(beta) * \
+#                 firedrake.sqrt(firedrake.inner(u, u) + u_0**2) ** (1 / m + 1)
+#     else:
+#         myerror(f"Invalid friction model: {inversionParams['friction']}")
+#     return logFriction
 
 
 def setupTaperedMasks(inversionParams, grounded, floating):
@@ -511,109 +536,13 @@ def setupTaperedMasks(inversionParams, grounded, floating):
 
 
 
-
-
-def parameterInfo(solver, area, message=''):
-    """
-    Print various statistics
-    """
-    floating = solver.problem.diagnostic_solve_kwargs['floating']
-    grounded = solver.problem.diagnostic_solve_kwargs['grounded']
-    areaFloating = firedrake.assemble(floating * firedrake.dx)
-    areaGrounded = firedrake.assemble(grounded * firedrake.dx)
-    avgFloat = firedrake.assemble(solver.parameter * floating *
-                                  firedrake.dx) / areaFloating
-    avgGrounded = firedrake.assemble(solver.parameter * grounded *
-                                     firedrake.dx) / areaGrounded
-    Print(f'{message} grounded {avgGrounded:9.2e} floating {avgFloat:9.2e}')
-
-
-def printExtremes(**kwargs):
-    ''' Print min/max of firedrake functions to flag bad inputs'''
-    Print('Min/Max of input values')
-    Print(''.join(['-']*40))
-    for arg in kwargs:
-        Print(arg, kwargs[arg].dat.data_ro.min(),
-              kwargs[arg].dat.data_ro.max())
-    Print(''.join(['-']*40))
-
-# ---- Perform Inversion -----
-
-def setupModel(frictionLaw, viscosity, **opts):
-    '''
-    Setup icestream model
-
-    Parameters
-    ----------
-    frictionLaw : TYPE
-        DESCRIPTION.
-    viscosity : TYPE
-        DESCRIPTION.
-    **opts : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    solver : TYPE
-        DESCRIPTION.
-
-    '''
-    model = icepack.models.IceStream(friction=frictionLaw,
-                                     viscosity=viscosity)
-    solver = icepack.solvers.FlowSolver(model, **opts)
-    #
-    return solver
-
-
-
-
-# ---- Plot Results ----
-
-def plotResults(solverBeta, solverTheta, uObs, uFinal, inversionParams, Q):
-    """
-    After the inversion is complete plot the inverted parameter and resulting
-    velocity error.
-    """
-    if not inversionParams['plotResult']:
-        return
-    #
-    if inversionParams['solveViscosity']:
-        figP, axesP = icepack.plot.subplots(1, 2)
-    else:
-        figP, axesP = icepack.plot.subplots(1, 1)
-        axesP = [axesP]
-    cBeta = icepack.plot.tricontourf(solverBeta.parameter, axes=axesP[0])
-    figP.colorbar(cBeta, ax=axesP[0])
-    if inversionParams['solveViscosity']:
-        cTheta = icepack.plot.tricontourf(solverTheta.parameter, axes=axesP[1])
-        figP.colorbar(cTheta, ax=axesP[1])
-    # velocity error
-    figU, axesU = icepack.plot.subplots(1, 2)
-    if solverTheta is None:
-        ui = solverBeta.state
-    else:
-        ui = solverTheta.state
-    speedError = firedrake.sqrt(firedrake.inner(uObs - ui, uObs - ui))
-    speedError = icepack.interpolate(speedError, Q)
-    speedErrorFinal = firedrake.sqrt(firedrake.inner(uFinal - ui, uFinal - ui))
-    speedErrorFinal = firedrake.interpolate(speedErrorFinal, Q)
-    levels = np.linspace(0, 200, 26)
-    cSpeed = icepack.plot.tricontourf(speedError, levels=levels,
-                                      extend='max', axes=axesU[0])
-    figU.colorbar(cSpeed, ax=axesU[0])
-    cSpeedFinal = icepack.plot.tricontourf(speedErrorFinal, levels=levels,
-                                           extend='max', axes=axesU[1])
-    figU.colorbar(cSpeedFinal, ax=axesU[1])
-    plt.show()
-
-
 def saveInversionResult(mesh, inversionParams, modelResults, beta, theta, uInv,
-                      A, grounded, floating, h, s, zb, uObs):
+                        A, grounded, floating, h, s, zb, uObs):
     """
     Save results to a firedrake dumbcheckpoint file
     """
-    outFile = \
-        f'{inversionParams["inversionResult"]}.deg{inversionParams["degree"]}.h5'
+    deg = inversionParams["degree"]
+    outFile = f'{inversionParams["inversionResult"]}.deg{deg}.h5'
     # Names used in checkpoint file - use dict for yaml dump
     varNames = {'uInv': 'uInv', 'betaInv': 'betaInv', 'AInv': 'AInv',
                 'groundedInv': 'groundedInv', 'floatingInv': 'floatingInv',
@@ -623,7 +552,7 @@ def saveInversionResult(mesh, inversionParams, modelResults, beta, theta, uInv,
     myVars = {'AInv': A, 'groundedInv': grounded, 'floatingInv': floating,
               'hInv': h, 'sInv': s, 'zbInv': zb, 'uObsInv': uObs}
     # Write results to check point file
-    with firedrake.CheckpointFile(outFile, 'w') as chk:
+    with mf.CheckpointFileNFS(outFile, 'w') as chk:
         chk.save_mesh(mesh)
         # Beta solutio
         chk.save_function(beta, name=varNames['betaInv'])
@@ -650,49 +579,47 @@ def saveInversionResult(mesh, inversionParams, modelResults, beta, theta, uInv,
 def main():
     #
     # process command line arags
-    global RS
     inversionParams = setupInversionArgs()
- 
     modelResults = {}
     modelResults['begin_time'] = datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
     Print(inversionParams)
     startTime = datetime.now()
-  
-    #solverMethod = getSolverMethod(inversionParams['solverMethod'])
-    viscosityLaw = taperedViscosity
-    #viscosityLaw = nonTaperedViscosity
     #
+    viscosityLaw = taperedViscosityIS
     # Read mesh and setup function spaces
     if inversionParams['initFile'] is not None:
         meshI = mf.getMeshFromCheckPoint(inversionParams['initFile'])
     else:
         meshI = None
+    #
     mesh, Q, V, meshOpts = \
         mf.setupMesh(inversionParams['mesh'],
                      degree=inversionParams['degree'],
                      meshOversample=inversionParams['meshOversample'],
                      newMesh=meshI)
-    RS = firedrake.FunctionSpace(mesh, "R", 0)
+    area = firedrake.assemble(firedrake.Constant(1) * firedrake.dx(mesh))
     Print(f'Mesh Elements={mesh.num_cells()} Vertices={mesh.num_vertices()}')
-    # Get friction law and solver methods
-    frictionLaw = getFrictionLaw(inversionParams)
-    # Set up deg 1 function space if using deg 1 to init solution
-    #Q1 = None
-    #if inversionParams['initWithDeg1']:
-    #    Q1 = firedrake.FunctionSpace(mesh, family='CG', degree=1)
-    area = firedrake.assemble(Constant(1) * firedrake.dx(mesh))
+    #
+    if inversionParams['initFile'] is not None:
+        Print(f'Initialized beta with {inversionParams["initFile"]}')
+        betaTemp = mf.getCheckPointVars(inversionParams['initFile'],
+                                        'betaInv', Q)['betaInv']
+        beta0 = firedrake.Function(Q)
+        beta0.interpolate(betaTemp)
+    else:
+        print('fresh beta')
+        beta0 = firedrake.Function(Q)
+    #
     opts = {'dirichlet_ids': meshOpts['dirichlet_ids'],
             "diagnostic_solver_type": "petsc",
             "diagnostic_solver_parameters": {
-                #"snes_monitor": None,
-                "snes_type": "newtonls",
-                "snes_max_it":200,
-                "snes_linesearch_type": "nleqerr",
-                "ksp_type": "gmres",
-                "pc_type": "lu",
-                "pc_factor_mat_solver_type": "mumps",
+                  "snes_type": "newtonls",
+                  "snes_linesearch_type": "cp",
+                  "ksp_type": "gmres",
+                  "pc_type": "lu",
+                  "pc_factor_mat_solver_type": "mumps",
+              }
             }
-        }
     #
     # Input model geometry and velocity
     zb, s, h, floating, grounded = \
@@ -702,30 +629,28 @@ def main():
     # Smooth versions of masks for tapered function
     groundedSmooth, floatingSmooth = setupTaperedMasks(inversionParams,
                                                        grounded, floating)
-    # Get speed
+    # Get observed speed and velocity
     uObs, speed, sigmaX, sigmaY = \
         mf.getModelVelocity(inversionParams['velocity'], Q, V,
                             minSigma=5, maxSigma=100)
-    #print(inversionParams['velocity'])
-    #print(inversionParams['meshOversample'])
-    #print('A', speed.dat.data_ro.min(), speed.dat.data_ro.max())
-    #myerror("STO")
     # Get initial guess for rheology
     if inversionParams['rateFactorB'] is not None:
         A = mf.getRateFactor(inversionParams['rateFactorB'], Q)
     else:
-        A = mf.getRateFactor(inversionParams['rateFactorA'], Q, Ainput=True) 
+        A = mf.getRateFactor(inversionParams['rateFactorA'], Q, Ainput=True)
     #
     # Initialize beta and theta
     Print(f'run time {datetime.now()-startTime}')
-    beta0 = betaInit(s, h, speed, V, Q, grounded, inversionParams)
+    frictionLaw = mf.getFrictionLaw(s, h, uObs, Q, V,
+                                    inversionParams['friction'],
+                                    inversionParams['uThresh'])
+    #
     theta0 = thetaInit(A, Q, grounded, floating, inversionParams)
     # Print min/max for quick QA of inputs
     printExtremes(h=h, s=s, A=A, beta=beta0, theta=theta0, speed=speed,
+                  sigmaX=sigmaX, sigmaY=sigmaY,
                   ground=grounded, floating=floating,
-                  groundedSmooth=groundedSmooth,floatingSmooth=floatingSmooth)
-    # Assign uThresh here to force correct type for parameter
-    uThresh = Constant(inversionParams['uThresh'])
+                  groundedSmooth=groundedSmooth, floatingSmooth=floatingSmooth)
     #
     solver = setupModel(frictionLaw, viscosityLaw,  **opts)
     #
@@ -736,108 +661,59 @@ def main():
                                 groundedSmooth=groundedSmooth,
                                 floatingSmooth=floatingSmooth,
                                 floating=floating)
-    mf.velocityError(uObs, u, area, message='Initial error')
-    #myerror("stop after diag")
+    vi = mf.velocityError(uObs, u, area, message='Initial error')
+    modelResults['initialError'] = vi
+    printExtremes(uObs=uObs, uInitial=u)
     # Compute initial error and objective funtion
-   
     Print(f'Time for initial model {datetime.now() - startTime}')
     #
-    myEstimator = setupInversion(solver, beta0, theta0, h, s, A, uObs, grounded,
-                                 floating, groundedSmooth, floatingSmooth,
+    betaFinal = beta0.copy(deepcopy=True)
+    thetaFinal = theta0.copy(deepcopy=True)
+    myEstimator = setupInversion(solver, betaFinal, thetaFinal, h, s, A, uObs,
+                                 grounded, floating,
+                                 groundedSmooth, floatingSmooth,
                                  sigmaX, sigmaY,
-                                 opts, inversionParams)
-    from firedrake.adjoint import get_working_tape
-
-    tape = get_working_tape()
-    print("Tape state:", tape)
-
+                                 opts, inversionParams, area)
+    #
+    # Run the single or joint solution
     if inversionParams['solveBeta'] and not inversionParams['solveViscosity']:
         Print('solving for beta only')
-        betaFinal =  myEstimator.solve()
+        betaFinal = myEstimator.solve()
         thetaFinal = theta0
     else:
         Print('solving for beta and Viscosity')
-        betaFinal, thetaFinal =  myEstimator.solve()
+        betaFinal, thetaFinal = myEstimator.solve()
     #
+    # Run the forward model with the final values
     uInv = solver.diagnostic_solve(velocity=uObs, thickness=h, surface=s,
-                                fluidity=A,
-                                beta=betaFinal, theta=thetaFinal, 
-                                grounded=grounded,
-                                groundedSmooth=groundedSmooth,
-                                floatingSmooth=floatingSmooth,
-                                floating=floating)
-    #myerror("stop after diag")
-    
+                                   fluidity=A,
+                                   beta=betaFinal, theta=thetaFinal,
+                                   grounded=grounded,
+                                   groundedSmooth=groundedSmooth,
+                                   floatingSmooth=floatingSmooth,
+                                   floating=floating)
     #
-    # # Write results to a dumb check point file
-    saveInversionResult(mesh, inversionParams, modelResults, betaFinal, 
+    # Compute summary stats
+    # error
+    ve = mf.velocityError(uObs, uInv, area, message='Final error')
+    modelResults['finalError'] = ve
+    #
+    # loss
+    finalLoss = float(firedrake.assemble(
+        myEstimator.problem.loss_functional[0](uInv)))
+    print('final loss', finalLoss)
+    modelResults['finalLoss'] = finalLoss
+    # regularization
+    finalRegularization = float(firedrake.assemble(
+        myEstimator.problem.regularization[0]([betaFinal, thetaFinal])))
+    print('final regularization', finalRegularization)
+    modelResults['finalRegularization'] = finalRegularization
+    #
+    # Write results to a dumb check point file
+    saveInversionResult(mesh, inversionParams, modelResults, betaFinal,
                         thetaFinal, uInv,
                         A, grounded, floating, h, s, zb, uObs)
-        
-    mf.velocityError(uObs, uInv, area, message='Final error')
-    # # Do a final forward solver to evaluate error
-    # thetaFinal = theta
-    # if inversionParams['solveViscosity']:
-    #     thetaFinal = solverTheta.parameter
-    # betaFinal = beta
-    # if inversionParams['solveBeta']:
-    #     betaFinal = solverBeta.parameter
-    # # Solution to check that forward model consistent with inverse result
-    # uFinal = solver.diagnostic_solve(velocity=uObs, thickness=h, surface=s,
-    #                                  fluidity=A, theta=thetaFinal,
-    #                                  beta=betaFinal,
-    #                                  grounded=grounded,
-    #                                  floating=floating,
-    #                                  groundedSmooth=groundedSmooth,
-    #                                  floatingSmooth=floatingSmooth,
-    #                                  uThresh=uThresh)
-    # mf.velocityError(uObs, uFinal, area, message='Final error')
-    # # Plot results
-    # plotResults(solverBeta, solverTheta, uObs, uFinal, inversionParams, Q)
-    #myerror('stop')
-    # initObj = firedrake.assemble(
-    #     makeObjectiveBeta(uObs, grounded + floating, sigmaX, sigmaY)(u))
-    # Print(f'Objective for initial model {initObj:10.3e}')
-    # #
-    # # Setup problem for beta
-    # solverBeta, solverTheta = setupSolvers(h, s, u, uObs, A,
-    #                                        grounded, floating,
-    #                                        groundedSmooth, floatingSmooth,
-    #                                        sigmaX, sigmaY,
-    #                                        beta, theta, model, opts,
-    #                                        inversionParams, solverMethod, mesh)
-    #
-    # step solvers to do the actuall inversion
-    # runSolvers(solverBeta, solverTheta, modelResults, uObs, mesh,
-    #            rtol=inversionParams['rtol'],
-    #            nSteps=inversionParams['maxSteps'],
-    #            solveViscosity=inversionParams['solveViscosity'],
-    #            solveBeta=inversionParams['solveBeta'])
-    # sys.stdout.flush()
-    # #
-    # # Write results to a dumb check point file
-    # saveInversionResult(mesh, inversionParams, modelResults, solverBeta,
-    #                     solverTheta, A, theta, beta, grounded, floating, h, s,
-    #                     zb, uObs)
-    # # Do a final forward solver to evaluate error
-    # thetaFinal = theta
-    # if inversionParams['solveViscosity']:
-    #     thetaFinal = solverTheta.parameter
-    # betaFinal = beta
-    # if inversionParams['solveBeta']:
-    #     betaFinal = solverBeta.parameter
-    # # Solution to check that forward model consistent with inverse result
-    # uFinal = solver.diagnostic_solve(velocity=uObs, thickness=h, surface=s,
-    #                                  fluidity=A, theta=thetaFinal,
-    #                                  beta=betaFinal,
-    #                                  grounded=grounded,
-    #                                  floating=floating,
-    #                                  groundedSmooth=groundedSmooth,
-    #                                  floatingSmooth=floatingSmooth,
-    #                                  uThresh=uThresh)
-    # mf.velocityError(uObs, uFinal, area, message='Final error')
-    # # Plot results
-    # plotResults(solverBeta, solverTheta, uObs, uFinal, inversionParams, Q)
+
 
 
 main()
